@@ -1,39 +1,89 @@
+import asyncio
+import httpx
+import math
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# Initialize the central EEP Orchestrator
 app = FastAPI(title="Trust-Call API Gateway", version="1.0")
 
-# ---------------------------------------------------------
-# THE SHIELD: Pydantic Data Class
-# This strictly enforces the payload contract.
-# If the mobile app forgets a field, FastAPI instantly rejects it.
-# ---------------------------------------------------------
 class AudioPayload(BaseModel):
-    caller_id: str          # e.g., "123-4567"
-    identity_score: float   # Local 1:1 Cosine Similarity score from the phone
-    scrubbed_text: str      # The text after PII removal
-    audio_base64: str       # The raw 3-second audio chunk
+    caller_id: str          
+    identity_score: float   
+    scrubbed_text: str      
+    audio_base64: str       
 
 # ---------------------------------------------------------
-# THE MOCK ENDPOINT: Parallel Fan-Out Placeholder
+# MOCK IEP ENDPOINTS (Simulating Container 2 and Container 3)
+# ---------------------------------------------------------
+@app.post("/mock_rawnet")
+async def mock_rawnet():
+    await asyncio.sleep(0.1) # Simulates PyTorch/GPU processing time
+    return {"signal_score": 0.85}
+
+@app.post("/mock_distilbert")
+async def mock_distilbert():
+    await asyncio.sleep(0.15) # Simulates DistilBERT processing time
+    return {"semantic_score": 0.92}
+
+# ---------------------------------------------------------
+# LATE FUSION MATH
+# ---------------------------------------------------------
+def calculate_late_fusion(signal: float, semantic: float, identity: float) -> float:
+    """
+    Executes the Late Fusion formula to combine the scores from 
+    the Signal, Semantic, and Identity auditors.
+    """
+    # Weights for the formula (these can be tuned later based on testing)
+    w1, w2, w3 = 0.4, 0.4, 0.2 
+    
+    raw_score = (w1 * signal) + (w2 * semantic) + (w3 * identity)
+    
+    # Sigmoid function normalizing the final threat score between 0 and 1
+    return 1 / (1 + math.exp(-raw_score))
+
+# ---------------------------------------------------------
+# THE GATEWAY ORCHESTRATOR
 # ---------------------------------------------------------
 @app.post("/analyze")
 async def analyze_audio(payload: AudioPayload):
     """
-    Receives the 3-second audio payload from the React Native app.
-    Currently mocks the parallel routing to IEP 1 and IEP 2b.
+    Receives payload, fires parallel requests to IEPs, and calculates risk.
     """
-    # TODO: Implement httpx.AsyncClient and asyncio.gather() here [cite: 77]
-    # to send data to RawNet2 and DistilBERT simultaneously[cite: 78].
+    # In production, these URLs will be http://rawnet-container:8000/predict 
+    # and http://distilbert-container:8000/predict
+    url_rawnet = "http://127.0.0.1:8000/mock_rawnet"
+    url_distilbert = "http://127.0.0.1:8000/mock_distilbert"
     
-    print(f"Shield Passed: Received valid data for {payload.caller_id}")
     
-    # Mocking the Late Fusion Math response for now
-    # This unblocks the mobile app team so they can test their UI
+    async with httpx.AsyncClient() as client:
+        # Fire both HTTP requests simultaneously
+        task_1 = client.post(url_rawnet)
+        task_2 = client.post(url_distilbert)
+        
+        # Wait for both AI models to return their scores
+        results = await asyncio.gather(task_1, task_2)
+        
+        rawnet_data = results[0].json()
+        distilbert_data = results[1].json()
+
+    signal_score = rawnet_data.get("signal_score", 0.0)
+    semantic_score = distilbert_data.get("semantic_score", 0.0)
+    
+    # Apply the mathematical formula
+    final_risk = calculate_late_fusion(signal_score, semantic_score, payload.identity_score)
+    
+    # Define intervention threshold
+    threat_level = "CRITICAL" if final_risk > 0.75 else "SAFE"
+    action = "DUCK_AUDIO" if threat_level == "CRITICAL" else "NONE"
+    
     return {
         "status": "success",
-        "threat": "CRITICAL",  # Triggers the Haptic SOS on the phone 
-        "action": "DUCK_AUDIO", # Triggers the 80% volume ducking
-        "late_fusion_score": 0.92 
+        "threat": threat_level,
+        "action": action,
+        "late_fusion_score": round(final_risk, 3),
+        "breakdown": {
+            "signal": signal_score,
+            "semantic": semantic_score,
+            "identity": payload.identity_score
+        }
     }
