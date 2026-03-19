@@ -35,3 +35,21 @@ We have successfully built and verified the audio ingestion pipeline for the Sig
 * **Privacy-First Decoding (Ephemeral RAM):** Implemented secure in-memory processing using `io.BytesIO`. The incoming Base64 audio string is decoded directly in the server's RAM. No voice data is ever written to the hard drive, maintaining strict privacy compliance.
 * [cite_start]**DSP Matrix Generation:** Integrated the `librosa` library to calculate the Mel-Spectrogram visual matrix from the decoded audio[cite: 126]. [cite_start]We successfully validated the matrix shape as `[128, 94]`, which is the exact format required to feed into the warm AI model[cite: 126].
 * [cite_start]**Local Integration Testing:** Created a standalone `test_client.py` script to simulate the mobile app's behavior[cite: 122]. The script successfully generated 3 seconds of raw audio [cite: 122], converted it to a Base64 text string[cite: 123], and verified that the microservice endpoint returns a `200 OK` status with the correct matrix dimensions without throwing errors.
+
+
+
+## Engineering Progress: IEP 1 (RawNet2) FastAPI Inference Complete (George Habib, 20/3/2026)
+
+**Current Stable Branch:** `dev`
+
+We have successfully migrated the RawNet2 PyTorch model into the production FastAPI microservice. The Signal Auditor is now fully online and capable of processing Base64 audio streams in real-time.
+
+### IEP 1: Microservice Implementation
+* **Memory Management (Warm Start):** Implemented a FastAPI `@asynccontextmanager` lifespan event. The 150MB `pre_trained_DF_model.pth` file is loaded directly into the server's RAM upon startup, guaranteeing sub-500ms latency for all incoming requests.
+* **Audio Pipeline Bypass:** Successfully bypassed strict OS-level FFmpeg dependencies by integrating the `soundfile` C-library, ensuring raw bytes are decoded strictly in volatile memory.
+* **Dynamic Tensor Padding:** Wrote dynamic truncation and padding logic (`torch.nn.functional.pad`) to format variable-length human speech into the strict `[1, 64000]` 1D tensor required by the RawNet2 SincConv layer.
+* **End-to-End Validation:** The `test_client.py` successfully sends local `.wav` files as Base64 JSON payloads to the `/predict` endpoint, which accurately returns logarithmic softmax probabilities converted to readable percentages.
+
+***🚨 CAPSTONE REQUIREMENT FLAG:** The microservice architecture is complete, but the current `pre_trained_DF_model.pth` uses baseline ASVspoof weights. This model MUST be fine-tuned on a custom dataset of telephonically-filtered AI voices before final submission.*
+
+

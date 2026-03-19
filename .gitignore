@@ -214,3 +214,8 @@ datasets/
 *.flac
 *.mp3
 *.m4a
+
+
+# Ignore heavy AI weights and audio tests
+*.pth
+*.wav
