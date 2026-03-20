@@ -38,7 +38,7 @@ We have successfully built and verified the audio ingestion pipeline for the Sig
 
 
 
-## Engineering Progress: IEP 1 (RawNet2) FastAPI Inference Complete (George Habib, 20/3/2026)
+## Engineering Progress: IEP 1 (RawNet2) FastAPI Inference Complete (DATE: 19/3/2026, AUTHOR: GEORGE HABIB)
 
 **Current Stable Branch:** `dev`
 
@@ -52,4 +52,15 @@ We have successfully migrated the RawNet2 PyTorch model into the production Fast
 
 ***🚨 CAPSTONE REQUIREMENT FLAG:** The microservice architecture is complete, but the current `pre_trained_DF_model.pth` uses baseline ASVspoof weights. This model MUST be fine-tuned on a custom dataset of telephonically-filtered AI voices before final submission.*
 
+## Engineering Progress: Cross-Microservice Integration Complete (DATE: 20/3/2026, AUTHOR: GEORGE HABIB)
+
+**Current Stable Branch:** `dev`
+
+Successfully established local network communication between the EEP API Gateway and the RawNet2 AI Microservice. The cloud architecture is now fully capable of end-to-end payload routing and centralized decision-making.
+
+### IEP 2: Gateway Routing & Business Logic
+* **Asynchronous Networking:** Upgraded the EEP Gateway (`eep-gateway/main.py`) with `httpx.AsyncClient`. It now successfully intercepts Base64 audio payloads from the mobile client and securely forwards them to the isolated AI Microservice (`http://localhost:8000/predict`).
+* **Centralized Cloud Logic:** Shifted the core business logic from the mobile client to the cloud. The Gateway evaluates raw AI telemetry to generate an actionable system directive (`BLOCK` or `ALLOW`) based on a >50% spoof probability threshold.
+* **Hybrid JSON Responses:** Structured the API to return a dual-payload containing both the strict system directive (for device execution) and the raw AI percentages (for UI rendering).
+* **End-to-End Validation:** Verified the complete pipeline using a local Python client. Real audio is correctly processed through the Gateway to the AI brain and back, returning a 99.96% `SAFE` classification.
 
