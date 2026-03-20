@@ -1,89 +1,57 @@
-import asyncio
 import httpx
-import math
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="Trust-Call API Gateway", version="1.0")
+app = FastAPI(title="Trust-Call EEP Gateway")
 
+# Define the URL of your local AI Microservice (Container 2)
+RAWNET_SERVICE_URL = "http://localhost:8000/predict"
+
+# The payload we expect from the mobile app
 class AudioPayload(BaseModel):
-    caller_id: str          
-    identity_score: float   
-    scrubbed_text: str      
-    audio_base64: str       
+    base64_audio: str
 
-# ---------------------------------------------------------
-# MOCK IEP ENDPOINTS (Simulating Container 2 and Container 3)
-# ---------------------------------------------------------
-@app.post("/mock_rawnet")
-async def mock_rawnet():
-    await asyncio.sleep(0.1) # Simulates PyTorch/GPU processing time
-    return {"signal_score": 0.85}
-
-@app.post("/mock_distilbert")
-async def mock_distilbert():
-    await asyncio.sleep(0.15) # Simulates DistilBERT processing time
-    return {"semantic_score": 0.92}
-
-# ---------------------------------------------------------
-# LATE FUSION MATH
-# ---------------------------------------------------------
-def calculate_late_fusion(signal: float, semantic: float, identity: float) -> float:
-    """
-    Executes the Late Fusion formula to combine the scores from 
-    the Signal, Semantic, and Identity auditors.
-    """
-    # Weights for the formula (these can be tuned later based on testing)
-    w1, w2, w3 = 0.4, 0.4, 0.2 
-    
-    raw_score = (w1 * signal) + (w2 * semantic) + (w3 * identity)
-    
-    # Sigmoid function normalizing the final threat score between 0 and 1
-    return 1 / (1 + math.exp(-raw_score))
-
-# ---------------------------------------------------------
-# THE GATEWAY ORCHESTRATOR
-# ---------------------------------------------------------
 @app.post("/analyze")
 async def analyze_audio(payload: AudioPayload):
-    """
-    Receives payload, fires parallel requests to IEPs, and calculates risk.
-    """
-    # In production, these URLs will be http://rawnet-container:8000/predict 
-    # and http://distilbert-container:8000/predict
-    url_rawnet = "http://127.0.0.1:8000/mock_rawnet"
-    url_distilbert = "http://127.0.0.1:8000/mock_distilbert"
-    
-    
-    async with httpx.AsyncClient() as client:
-        # Fire both HTTP requests simultaneously
-        task_1 = client.post(url_rawnet)
-        task_2 = client.post(url_distilbert)
+    try:
+        # 1. Forward the audio to the AI Brain (RawNet2 Microservice)
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                RAWNET_SERVICE_URL,
+                json={"base64_audio": payload.base64_audio},
+                timeout=10.0 # Don't wait forever, drop the call if it takes too long
+            )
+            
+        # 2. Check if the AI Brain crashed or threw an error
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail="AI Inference Service Failed")
+            
+        # 3. Extract the raw percentages from the AI Brain
+        ai_data = response.json()
+        spoof_prob = ai_data.get("spoof_probability_percent", 0.0)
+        real_prob = ai_data.get("real_probability_percent", 0.0)
         
-        # Wait for both AI models to return their scores
-        results = await asyncio.gather(task_1, task_2)
-        
-        rawnet_data = results[0].json()
-        distilbert_data = results[1].json()
-
-    signal_score = rawnet_data.get("signal_score", 0.0)
-    semantic_score = distilbert_data.get("semantic_score", 0.0)
-    
-    # Apply the mathematical formula
-    final_risk = calculate_late_fusion(signal_score, semantic_score, payload.identity_score)
-    
-    # Define intervention threshold
-    threat_level = "CRITICAL" if final_risk > 0.75 else "SAFE"
-    action = "DUCK_AUDIO" if threat_level == "CRITICAL" else "NONE"
-    
-    return {
-        "status": "success",
-        "threat": threat_level,
-        "action": action,
-        "late_fusion_score": round(final_risk, 3),
-        "breakdown": {
-            "signal": signal_score,
-            "semantic": semantic_score,
-            "identity": payload.identity_score
+        # 4. The Cloud Decision Logic (Business Logic)
+        # If the AI is more than 50% sure it is a deepfake, block the call.
+        if spoof_prob > 50.0:
+            decision = "BLOCK"
+            threat_level = "CRITICAL"
+        else:
+            decision = "ALLOW"
+            threat_level = "SAFE"
+            
+        # 5. Return the hybrid payload back to the Mobile App
+        return {
+            "status": "success",
+            "decision": decision,
+            "threat_level": threat_level,
+            "details": {
+                "spoof_probability_percent": spoof_prob,
+                "real_probability_percent": real_prob
+            }
         }
-    }
+
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="AI Brain is offline. Please ensure rawnet-service is running.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
