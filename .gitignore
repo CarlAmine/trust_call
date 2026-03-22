@@ -219,3 +219,13 @@ datasets/
 # Ignore heavy AI weights and audio tests
 *.pth
 *.wav
+
+
+# React Native / Node
+TrustCallApp/node_modules/
+
+# Android Build Caches
+TrustCallApp/android/.gradle/
+TrustCallApp/android/build/
+TrustCallApp/android/app/build/
+TrustCallApp/android/app/.cxx/

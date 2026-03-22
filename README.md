@@ -64,3 +64,32 @@ Successfully established local network communication between the EEP API Gateway
 * **Hybrid JSON Responses:** Structured the API to return a dual-payload containing both the strict system directive (for device execution) and the raw AI percentages (for UI rendering).
 * **End-to-End Validation:** Verified the complete pipeline using a local Python client. Real audio is correctly processed through the Gateway to the AI brain and back, returning a 99.96% `SAFE` classification.
 
+
+## 📱 Mobile App Setup (Android) (DATE: 22/3/2026, AUTHOR: GEORGE HABIB)
+
+Welcome to the Trust-Call React Native app! Native Android development on Windows requires strict environment configurations. **Please read this carefully before running the app.**
+
+### ⚠️ Crucial Windows Prerequisites
+If you are developing on Windows, you **MUST** do these two things before building, or the C++ compiler will crash:
+1. **Move out of OneDrive:** Do not clone this repo into a OneDrive or deeply nested folder. Clone it directly to a root drive (e.g., `C:\trust_call` or `E:\trust_call`).
+2. **Enable Windows Long Paths:** The WebRTC and TFLite C++ libraries exceed standard Windows file path limits. Open an Administrator PowerShell and run:
+   `New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force`
+
+### 🛠️ Required Android Studio Tools
+Open Android Studio -> SDK Manager -> SDK Tools (Check "Show Package Details" at the bottom right) and ensure you have these installed:
+* **NDK (Side by side):** Version `27.1.12297006`
+* **CMake:** Version `3.22.1`
+
+### 🚀 Running the App
+1. Open your Android Virtual Device (AVD) in Android Studio and ensure it is powered on.
+2. Install dependencies:
+   ```bash
+    npm install
+
+3. Start the Metro Bundler (in terminal 1):
+    ```Bash
+    npm start
+
+4. Build the Android app (in terminal 2):
+    ```Bash
+    npx react-native run-android
