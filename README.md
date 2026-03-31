@@ -93,3 +93,22 @@ Open Android Studio -> SDK Manager -> SDK Tools (Check "Show Package Details" at
 4. Build the Android app (in terminal 2):
     ```Bash
     npx react-native run-android
+
+
+
+## Engineering Progress:  (DATE: 31/3/2026, AUTHOR: GEORGE HABIB)
+📱 React Native Frontend
+WebRTC Integration: Successfully implemented react-native-webrtc to handle real-time audio streams.
+
+Native Security: Engineered a robust Android permissions flow to safely request and handle hardware access (Microphone/Camera) without triggering OS-level crashes.
+
+Signaling Pipeline: Built an SDP Offer generation system in CallScreen.tsx that successfully transmits WebRTC handshakes to the local Python server via the Android emulator's network bridge.
+
+UI/UX: Constructed the foundational CallScreen interface to display live AI telemetry metrics and late-fusion decision status.
+
+🧠 Python AI Backend
+Environment Setup: Initialized an isolated Python virtual environment utilizing FastAPI and aiortc for real-time media handling.
+
+API Architecture: Created a local server endpoint (/offer) equipped with CORS middleware to catch and negotiate WebRTC handshakes from the mobile app.
+
+Real-Time Audio Buffer Engine: Engineered an asynchronous background worker that successfully consumes live 20ms audio frames, extracts the sample rate, and efficiently batches them into precise 3-second numpy arrays entirely in RAM, preparing them for downstream ML processing (RawNet2/ECAPA).
