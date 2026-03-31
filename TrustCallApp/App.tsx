@@ -2,33 +2,34 @@ import React from 'react';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 
+// Notice how we import them from the src/screens folder based on your screenshot
 import HomeScreen from './src/screens/HomeScreen';
-import CallScreen from './src/screens/CallScreen'; // We imported the new screen!
+import CallScreen from './src/screens/CallScreen';
 
 const Stack = createNativeStackNavigator();
 
-function App(): React.JSX.Element {
+const App = () => {
   return (
     <NavigationContainer>
-      <Stack.Navigator initialRouteName="Home">
+      <Stack.Navigator initialRouteName="HomeScreen">
+        
+        {/* Route 1: The Home Screen */}
         <Stack.Screen 
-          name="Home" 
+          name="HomeScreen" 
           component={HomeScreen} 
-          options={{ 
-            title: 'Trust-Call Shield',
-            headerStyle: { backgroundColor: '#1E1E1E' },
-            headerTintColor: '#fff'
-          }} 
+          options={{ headerShown: false }} 
         />
-        {/* We registered the new screen here! */}
+        
+        {/* Route 2: The Call Screen (This fixes your error!) */}
         <Stack.Screen 
-          name="Call" 
+          name="CallScreen" 
           component={CallScreen} 
-          options={{ headerShown: false }} // Hides the top bar during a call to look native
+          options={{ headerShown: false }} 
         />
+
       </Stack.Navigator>
     </NavigationContainer>
   );
-}
+};
 
 export default App;

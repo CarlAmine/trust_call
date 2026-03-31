@@ -1,5 +1,30 @@
 import React from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView } from 'react-native';
+import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, Button, PermissionsAndroid, Platform, Alert } from 'react-native';
+
+const requestCallPermissions = async () => {
+  if (Platform.OS !== 'android') return true;
+
+  try {
+    const granted = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.CAMERA,
+      PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+    ]);
+
+    const cameraGranted = granted['android.permission.CAMERA'] === PermissionsAndroid.RESULTS.GRANTED;
+    const audioGranted = granted['android.permission.RECORD_AUDIO'] === PermissionsAndroid.RESULTS.GRANTED;
+
+    if (cameraGranted && audioGranted) {
+      console.log('Permissions granted! Safe to start WebRTC.');
+      return true;
+    } else {
+      Alert.alert('Permissions Required', 'Trust-Call Shield needs camera and microphone access to simulate the call.');
+      return false;
+    }
+  } catch (err) {
+    console.warn('Error requesting permissions:', err);
+    return false;
+  }
+};
 
 const HomeScreen = ({ navigation }: any) => {
   return (
@@ -11,12 +36,16 @@ const HomeScreen = ({ navigation }: any) => {
       </View>
 
       <View style={styles.buttonContainer}>
-      <TouchableOpacity 
-          style={styles.callButton}
-          onPress={() => navigation.navigate('Call')}
-        >
-          <Text style={styles.buttonText}>Simulate Incoming Call</Text>
-        </TouchableOpacity>
+        <Button 
+          title="Simulate Incoming Call"
+          onPress={async () => {
+            const hasPermission = await requestCallPermissions();
+            if (!hasPermission) return;
+
+            // FIX: Navigate to the CallScreen instead of calling the placeholder
+            navigation.navigate('CallScreen'); 
+          }} 
+        />
       </View>
     </SafeAreaView>
   );
