@@ -5,6 +5,12 @@ from pydantic import BaseModel
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from fastapi.middleware.cors import CORSMiddleware
 
+
+import io
+import base64
+import httpx
+import soundfile as sf
+
 app = FastAPI()
 
 app.add_middleware(
@@ -18,6 +24,29 @@ app.add_middleware(
 class Offer(BaseModel):
     sdp: str
     type: str
+
+
+
+async def send_to_rawnet(base64_audio: str):
+    """Sends the audio to the RawNet2 microservice in the background."""
+    payload = {"base64_audio": base64_audio}
+    try:
+        # We use AsyncClient so it doesn't block the live WebRTC stream
+        async with httpx.AsyncClient() as client:
+            response = await client.post("http://127.0.0.1:8000/predict", json=payload, timeout=5.0)
+            
+            if response.status_code == 200:
+                data = response.json()
+                spoof = data.get('spoof_probability_percent')
+                real = data.get('real_probability_percent')
+                
+                # Print the AI's verdict to the terminal!
+                print(f"🤖 [AI AUDITOR] -> AI: {spoof}% | Human: {real}%")
+            else:
+                print(f"❌ AI Server Error: {response.text}")
+                
+    except Exception as e:
+        print(f"❌ Failed to reach AI server. Is it running on port 8000? Error: {e}")
 
 # --- THE AUDIO BUFFER ENGINE ---
 async def consume_audio_track(track):
@@ -34,7 +63,7 @@ async def consume_audio_track(track):
             # 2. Convert PyAV frame to a numerical numpy array
             audio_array = frame.to_ndarray()
             
-            # Grab the sample rate from the very first frame (usually 48000Hz)
+            # Grab the sample rate from the very first frame
             if sample_rate == 0:
                 sample_rate = frame.sample_rate
                 print(f"⚙️ Audio format locked in at: {sample_rate}Hz")
@@ -43,26 +72,36 @@ async def consume_audio_track(track):
             audio_buffer.append(audio_array)
 
             # 4. Check if we have collected 3 seconds of audio yet
-            # shape[1] contains the number of audio samples in this specific frame
             total_samples = sum(arr.shape[1] for arr in audio_buffer) 
             current_duration = total_samples / sample_rate
 
+            # THE FIX: Use the calculated duration, not an undefined variable!
             if current_duration >= TARGET_SECONDS:
-                print(f"📦 BOOM! {TARGET_SECONDS} seconds of audio buffered. Ready for ML models!")
+                print(f"📦 BOOM! {current_duration:.2f} seconds buffered. Dispatching to AI...")
                 
-                # ---> THIS IS WHERE THE MAGIC WILL HAPPEN NEXT TIME <---
-                # You will concatenate the buffer into one big array:
-                # full_audio_chunk = np.concatenate(audio_buffer, axis=1)
-                # pass_to_rawnet2(full_audio_chunk)
-                # pass_to_ecapa(full_audio_chunk)
+                # 1. Combine frames (axis=1 stacks them along the timeline, .T rotates for soundfile)
+                combined_audio = np.concatenate(audio_buffer, axis=1).T
                 
-                # 5. Clear the buffer to start collecting the next 3 seconds
-                audio_buffer = []
+                # 2. Use the NATIVE sample_rate, not hardcoded 16000! 
+                wav_io = io.BytesIO()
+                sf.write(wav_io, combined_audio, sample_rate, format='WAV', subtype='PCM_16')
+                wav_bytes = wav_io.getvalue()
+                
+                # 3. Encode to Base64 string
+                base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
+                
+                # 4. Fire the async background task to the AI server
+                asyncio.create_task(send_to_rawnet(base64_audio))
+                
+                # 5. Clear the buffer using the correct variable name
+                audio_buffer.clear()
 
         except Exception as e:
-            print("🛑 Audio stream ended or disconnected.")
+            print(f"🛑 Audio stream ended or disconnected. Reason: {e}")
             break
 # -------------------------------
+
+
 
 @app.post("/offer")
 async def process_offer(params: Offer):
