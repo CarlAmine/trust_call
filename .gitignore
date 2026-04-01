@@ -229,3 +229,15 @@ TrustCallApp/android/.gradle/
 TrustCallApp/android/build/
 TrustCallApp/android/app/build/
 TrustCallApp/android/app/.cxx/
+
+
+
+# Ignore training audio and Hugging Face cache
+training_data/
+hf_cache/
+*.wav
+*.pth
+
+# Ignore Python environments and cache
+venv/
+__pycache__/

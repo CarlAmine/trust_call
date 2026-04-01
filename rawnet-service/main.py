@@ -31,7 +31,8 @@ async def lifespan(app: FastAPI):
     
     model = RawNet(d_args, device)
     model = model.to(device)
-    model.load_state_dict(torch.load("pre_trained_DF_model.pth", map_location=device, weights_only=True))
+    #model.load_state_dict(torch.load("pre_trained_DF_model.pth", map_location=device, weights_only=True))
+    model.load_state_dict(torch.load("fine_tuned_DF_model.pth", map_location=device, weights_only=True))
     model.eval()
     
     app.state.model = model

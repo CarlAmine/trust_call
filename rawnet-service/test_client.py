@@ -4,7 +4,7 @@ import os
 import sys
 
 # 1. Point this to your test audio file
-test_audio_path = "test_voice.wav"
+test_audio_path = "test_voice_AI.wav"
 
 if not os.path.exists(test_audio_path):
     print(f"❌ Error: '{test_audio_path}' not found. Please copy your test_voice.wav into the rawnet-service folder.")
