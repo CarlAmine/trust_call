@@ -112,3 +112,29 @@ Environment Setup: Initialized an isolated Python virtual environment utilizing 
 API Architecture: Created a local server endpoint (/offer) equipped with CORS middleware to catch and negotiate WebRTC handshakes from the mobile app.
 
 Real-Time Audio Buffer Engine: Engineered an asynchronous background worker that successfully consumes live 20ms audio frames, extracts the sample rate, and efficiently batches them into precise 3-second numpy arrays entirely in RAM, preparing them for downstream ML processing (RawNet2/ECAPA).
+
+
+
+
+
+## Session Log: AI Fine-Tuning & Microservice Bridge (DATE: 1/4/2026, AUTHOR: GEORGE HABIB)
+
+### 🧠 1. RawNet2 Transfer Learning (Domain Adaptation)
+* **The Data Strategy:** Bypassed outdated datasets (ASVspoof 2021) to focus on modern TTS engines (ElevenLabs, Hume AI, etc.). Built `download_data.py` to stream the `garystafford/deepfake-audio-detection` dataset directly from Hugging Face.
+* **FFmpeg Bypass:** Engineered a solution to bypass Windows FFmpeg C++ dependency crashes by directly casting Hugging Face audio to raw bytes and writing them to disk using standard file I/O.
+* **The Training Pipeline:** Wrote `train_transfer.py` to perform transfer learning on our pre-trained RawNet2 weights. 
+  * **Frozen Layers:** Sinc_conv filters and Residual Blocks 0-5.
+  * **Unfrozen Layers:** GRU and Fully Connected classification layers.
+* **Results:** Fine-tuned the model on 1,000 files (500 Real / 500 Fake) for 20 epochs, achieving **96.7% training accuracy**.
+* **Zero-Shot Validation:** Successfully tested the new `fine_tuned_DF_model.pth` against a blind ElevenLabs deepfake via the `test_client.py` API, returning a **99.95% Spoof Probability**. 
+
+### 🌉 2. WebRTC to AI Bridge (The Microservice Link)
+* Connected the `trust_call_backend` (WebRTC) to the `rawnet-service` (AI FastAPI).
+* Upgraded the 3-second buffer engine in `server.py`:
+  * Concatenates live 20ms PyAV frames into a single `numpy` array.
+  * Fixes sample rate distortion by dynamically catching the native WebRTC mic sample rate (usually 48kHz) and converting it to a WAV file in memory (`io.BytesIO`).
+  * Utilizes `asyncio` and `httpx.AsyncClient` to POST the Base64 audio payload to the AI server in the background, ensuring the live phone call never drops packets or blocks the thread.
+
+### 📁 3. Version Control & Hygiene
+* Updated `.gitignore` in the AI directory to block massive binary files (`*.pth`), `hf_cache/`, and local `training_data/` from bloating the GitHub repository.
+* Safely merged the upgraded `rawnet-service` to the `dev` branch.
