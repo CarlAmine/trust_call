@@ -138,3 +138,35 @@ Real-Time Audio Buffer Engine: Engineered an asynchronous background worker that
 ### 📁 3. Version Control & Hygiene
 * Updated `.gitignore` in the AI directory to block massive binary files (`*.pth`), `hf_cache/`, and local `training_data/` from bloating the GitHub repository.
 * Safely merged the upgraded `rawnet-service` to the `dev` branch.
+
+
+
+# 🚀 Progress Update: Real-Time AI Telemetry Integration (DATE: 3/4/2026, AUTHOR: GEORGE HABIB)
+
+## 1. Real-Time Telemetry Bridge (FastAPI & WebSockets)
+
+Established a parallel WebSocket connection alongside the existing WebRTC audio pipeline to enable bidirectional, real-time communication.
+
+Implemented a `ConnectionManager` in the FastAPI gateway to manage active mobile client sockets and broadcast JSON payloads.
+
+Configured the backend to instantly push `RawNet2` biometric predictions down to the mobile device the moment a 3-second audio chunk is processed, achieving near-zero latency for UI updates.
+
+## 2. Dynamic UI & Threat Visualization (React Native)
+
+Upgraded the `CallScreen` component to actively listen to the WebSocket stream and parse incoming telemetry data.
+
+Mapped the JSON payload to React Native state variables, allowing the "Live AI Telemetry" board to update continuously without refreshing the screen.
+
+Implemented a dynamic threat-formatting engine: the backend now evaluates the spoof probability against a `>50%` threshold and sends an `is_threat` flag. The mobile UI dynamically formats the text ("Human" vs. "AI (Deepfake)") and swaps typography colors (Green for safe, Red for threat) based on this flag.
+
+## 3. Call Lifecycle & State Management
+
+Replaced automatic background audio streaming with an explicit `isCallActive` state machine.
+
+Implemented an "Accept Call" UI flow, ensuring that microphone permissions, WebRTC handshakes, WebSocket connections, and the call duration timer only initialize when the user explicitly interacts with the call prompt.
+
+## 4. Raw Audio Capture Optimization
+
+Configured advanced `mediaDevices.getUserMedia` constraints to intentionally disable Android's native audio preprocessing (Echo Cancellation, Noise Suppression, and Auto Gain Control).
+
+This ensures the `RawNet2` neural network receives pure, uncompressed, and unaltered acoustic data, drastically improving the model's ability to detect synthetic audio signatures and presentation attacks.
