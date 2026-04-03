@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, PermissionsAndroid, Platform } from 'react-native';
 import { mediaDevices, RTCPeerConnection, RTCSessionDescription } from 'react-native-webrtc';
+
 
 const CallScreen = ({ navigation }: any) => {
   const [callDuration, setCallDuration] = useState(0);
@@ -10,8 +11,21 @@ const CallScreen = ({ navigation }: any) => {
   const [peerConnection, setPeerConnection] = useState<any>(null);
   const [sdpOffer, setSdpOffer] = useState<string>('');
 
+  // Phase 3: Telemetry State Variables
+  const [signalScore, setSignalScore] = useState<string>('Analyzing...');
+  const [semanticStatus, setSemanticStatus] = useState<string>('Pending...');
+  const [identityStatus, setIdentityStatus] = useState<string>('Pending...');
+  const [fusionStatus, setFusionStatus] = useState<string>('WAITING');
+
+  const [signalColor, setSignalColor] = useState<string>('#4CAF50'); // Default Green
+
+  const [isCallActive, setIsCallActive] = useState(false);
+  
+  const ws = useRef<WebSocket | null>(null);
+
   const startAudioStream = async () => {
     try {
+      // 1. PERMISSIONS
       if (Platform.OS === 'android') {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
@@ -30,13 +44,16 @@ const CallScreen = ({ navigation }: any) => {
       }
 
       console.log('1. Permission granted! Initializing WebRTC stream...');
+      
+      // --- THE FIX 1: Revert to standard audio to prevent the "Dummy Track" bug ---
       const stream = await mediaDevices.getUserMedia({
-        audio: true,
+        audio: true, 
         video: false, 
       });
       setLocalStream(stream);
+      // -------------------------------------------------------------------------
 
-      // Phase 2: Building the WebRTC Pipe
+      // 2. WEBRTC HANDSHAKE
       console.log('2. Building Peer Connection...');
       const configuration = {
         iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -44,12 +61,10 @@ const CallScreen = ({ navigation }: any) => {
       const pc = new RTCPeerConnection(configuration);
       setPeerConnection(pc);
 
-      // Phase 2: Attach the live microphone audio
       stream.getTracks().forEach((track: any) => {
         pc.addTrack(track, stream);
       });
 
-      // Phase 2: Generate the Handshake Contract (Offer)
       console.log('3. Generating SDP Offer for Python Server...');
       const offer = await pc.createOffer({});
       await pc.setLocalDescription(offer);
@@ -59,25 +74,42 @@ const CallScreen = ({ navigation }: any) => {
 
       console.log('4. Sending Offer to Python Server...');
       try {
-        // 10.0.2.2 is the magic IP that lets the Android emulator see your computer's localhost
         const response = await fetch('http://10.0.2.2:8080/offer', {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            sdp: offer.sdp,
-            type: offer.type,
-          }),
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
         });
 
-        // Parse the answer we get back from Python
         const answer = await response.json();
         console.log('5. Received Answer from Python Server!');
 
-        // Complete the WebRTC handshake!
         await pc.setRemoteDescription(new RTCSessionDescription(answer));
         console.log('🟢 HANDSHAKE COMPLETE! Live audio is now flowing to Python.');
+
+        // --- THE FIX 2: Open the WebSocket strictly AFTER audio is flowing ---
+        console.log('6. Opening Telemetry WebSocket...');
+        ws.current = new WebSocket('ws://10.0.2.2:8080/ws'); 
+        
+        ws.current.onopen = () => console.log('🔗 WebSocket Connected to Telemetry Stream');
+        
+        ws.current.onmessage = (e) => {
+          try {
+            console.log("🔥 WEBSOCKET MESSAGE RECEIVED: ", e.data);
+            const data = JSON.parse(e.data);
+            setSignalScore(data.signal_score);
+            // If it's a threat, turn the text Red. Otherwise, keep it Green.
+            setSignalColor(data.is_threat ? '#FF3B30' : '#4CAF50'); 
+
+            setSemanticStatus(data.semantic_intent);
+            setIdentityStatus(data.identity_match);
+            setFusionStatus(data.fusion_status);
+          } catch (error) {
+            console.error("Error parsing telemetry data", error);
+          }
+        };
+        
+        ws.current.onerror = (e: any) => console.log('❌ WebSocket Error: ', e.message);
+        // ---------------------------------------------------------------------
 
       } catch (networkError) {
         console.error('Failed to connect to Python server. Is uvicorn running?', networkError);
@@ -88,17 +120,22 @@ const CallScreen = ({ navigation }: any) => {
     }
   };
 
-  useEffect(() => {
+const handleAcceptCall = () => {
+    setIsCallActive(true);
     startAudioStream();
-  }, []);
+  };
 
   useEffect(() => {
-    const timer = setInterval(() => {
-      setCallDuration((prev) => prev + 1);
-    }, 1000);
+    let timer: ReturnType<typeof setInterval>;
+    if (isCallActive) {
+      timer = setInterval(() => {
+        setCallDuration((prev) => prev + 1);
+      }, 1000);
+    }
     return () => clearInterval(timer);
-  }, []);
+  }, [isCallActive]);
 
+  
   const formatTime = (seconds: number) => {
     const mins = Math.floor(seconds / 60);
     const secs = seconds % 60;
@@ -112,6 +149,11 @@ const CallScreen = ({ navigation }: any) => {
     if (peerConnection) {
       peerConnection.close();
     }
+    // --- NEW: Close the socket ---
+    if (ws.current) {
+      ws.current.close();
+    }
+    // -----------------------------
     navigation.navigate('HomeScreen');
   };
 
@@ -127,32 +169,41 @@ const CallScreen = ({ navigation }: any) => {
         
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Signal (RawNet2):</Text>
-          <Text style={styles.metricValueSafe}>1.2% Spoof</Text>
+          <Text style={[styles.metricValueSafe, { color: signalColor }]}>{signalScore}</Text>
         </View>
         
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Semantic (Intent):</Text>
-          <Text style={styles.metricValueSafe}>Low Risk</Text>
+          <Text style={styles.metricValueSafe}>{semanticStatus}</Text>
         </View>
 
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Identity (ECAPA):</Text>
-          <Text style={styles.metricValueWarning}>Pending...</Text>
+          <Text style={styles.metricValueWarning}>{identityStatus}</Text>
         </View>
       </View>
 
       <View style={styles.decisionEngine}>
         <Text style={styles.decisionLabel}>Late Fusion Status</Text>
-        <Text style={styles.decisionSafe}>ANALYZING</Text>
+        <Text style={styles.decisionSafe}>{fusionStatus}</Text>
       </View>
 
-      <View style={styles.footer}>
-        <TouchableOpacity 
-          style={styles.endCallButton}
-          onPress={handleEndCall}
-        >
-          <Text style={styles.endCallText}>End Call</Text>
-        </TouchableOpacity>
+<View style={styles.footer}>
+        {!isCallActive ? (
+          <TouchableOpacity 
+            style={[styles.endCallButton, { backgroundColor: '#4CAF50' }]} 
+            onPress={handleAcceptCall}
+          >
+            <Text style={styles.endCallText}>Accept</Text>
+          </TouchableOpacity>
+        ) : (
+          <TouchableOpacity 
+            style={styles.endCallButton}
+            onPress={handleEndCall}
+          >
+            <Text style={styles.endCallText}>End Call</Text>
+          </TouchableOpacity>
+        )}
       </View>
     </SafeAreaView>
   );

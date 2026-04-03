@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 
 import io
@@ -26,6 +27,47 @@ class Offer(BaseModel):
     type: str
 
 
+# --- WEBSOCKET CONNECTION MANAGER ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: dict):
+        # --- THE FIX: Warn us if the array is empty! ---
+        if len(self.active_connections) == 0:
+            print("⚠️ WARNING: AI graded the audio, but no phone is connected to the WebSocket!")
+            return
+        # -----------------------------------------------
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                print(f"Failed to send websocket message: {e}")
+
+manager = ConnectionManager()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    print("\n👀 INCOMING WEBSOCKET CONNECTION...")
+    await manager.connect(websocket)
+    print("✅ WEBSOCKET ACCEPTED AND LOCKED IN!\n")
+    try:
+        while True:
+            # Keep the connection open waiting for the client
+            data = await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        print("🛑 WebSocket Client Disconnected")
+    except Exception as e:
+        print(f"⚠️ WebSocket Crash: {e}")
 
 async def send_to_rawnet(base64_audio: str):
     """Sends the audio to the RawNet2 microservice in the background."""
@@ -37,11 +79,26 @@ async def send_to_rawnet(base64_audio: str):
             
             if response.status_code == 200:
                 data = response.json()
-                spoof = data.get('spoof_probability_percent')
-                real = data.get('real_probability_percent')
+                spoof_raw = data.get('spoof_probability_percent')
+                real_raw = data.get('real_probability_percent')
                 
-                # Print the AI's verdict to the terminal!
-                print(f"🤖 [AI AUDITOR] -> AI: {spoof}% | Human: {real}%")
+                # 2. FORCE them to be floats so Python doesn't crash during math!
+                spoof_float = float(spoof_raw)
+                real_float = float(real_raw)
+                
+                print(f"🤖 [AI AUDITOR] -> AI: {spoof_float}% | Human: {real_float}%")
+                
+                # 3. Calculate the threat using the safe float numbers
+                is_threat = spoof_float > 50.0 
+                display_text = f"{spoof_float}% AI (Deepfake)" if is_threat else f"{real_float}% Human"
+                
+                await manager.broadcast({
+                    "signal_score": display_text,
+                    "is_threat": is_threat, 
+                    "semantic_intent": "Low Risk", 
+                    "identity_match": "Pending...", 
+                    "fusion_status": "ANALYZING"
+                })
             else:
                 print(f"❌ AI Server Error: {response.text}")
                 
@@ -58,70 +115,63 @@ async def consume_audio_track(track):
     chunk_counter = 0
     while True:
         try:
-            # 1. Catch the next tiny fraction of audio (20ms)
             frame = await track.recv()
-            
-            # 2. Convert PyAV frame to a numerical numpy array
             audio_array = frame.to_ndarray()
             
-            # --- THE FIX: Prevent the "Disk Scratch" & Stereo Bug ---
+            # --- SAFEGUARD: Prevent float-to-int silence bugs ---
+            is_float = np.issubdtype(audio_array.dtype, np.floating)
+
             num_channels = len(frame.layout.channels)
             if num_channels > 1:
                 if audio_array.shape[0] == 1:
-                    # Fix Interleaved Stereo ([L, R, L, R])
                     audio_array = audio_array.reshape(-1, num_channels)
                     audio_array = np.mean(audio_array, axis=1).reshape(1, -1)
                 else:
-                    # Fix Planar Stereo ([L, L, L], [R, R, R])
                     audio_array = np.mean(audio_array, axis=0, keepdims=True)
-                
-                # CRITICAL FIX: Convert floats back to 16-bit integers!
-                # This stops the audio from clipping into pure static.
+
+            # If the audio came in as a tiny decimal (-1.0 to 1.0), we MUST multiply it 
+            # by 32767 before turning it into a 16-bit integer, or it becomes zero!
+            if is_float:
+                audio_array = (audio_array * 32767.0).astype(np.int16)
+            else:
                 audio_array = audio_array.astype(np.int16)
             # --------------------------------------------------------
 
-            # Grab the sample rate from the very first frame
             if sample_rate == 0:
                 sample_rate = frame.sample_rate
-                print(f"⚙️ Audio format locked in at: {sample_rate}Hz (Mono int16)")
+                print(f"⚙️ Audio format locked in at: {sample_rate}Hz (Float: {is_float})")
 
-            # 3. Add the tiny frame to our waiting room (buffer)
             audio_buffer.append(audio_array)
 
-            # 4. Check if we have collected 3 seconds of audio yet
             total_samples = sum(arr.shape[1] for arr in audio_buffer) 
             current_duration = total_samples / sample_rate
 
             if current_duration >= TARGET_SECONDS:
                 chunk_counter += 1
-                print(f"📦 BOOM! {current_duration:.2f} seconds buffered. Dispatching to AI... (Chunk {chunk_counter})")
-                
-                # 1. Combine frames
                 combined_audio = np.concatenate(audio_buffer, axis=1).T
                 
-                # 2. Write to memory
+                # --- THE X-RAY: Check the absolute loudest sound in the chunk ---
+                max_volume = np.max(np.abs(combined_audio))
+                print(f"📦 BOOM! Chunk {chunk_counter} | Max Volume: {max_volume} | Dispatching...")
+                # ----------------------------------------------------------------
+
                 wav_io = io.BytesIO()
                 sf.write(wav_io, combined_audio, sample_rate, format='WAV', subtype='PCM_16')
                 wav_bytes = wav_io.getvalue()
                 
-                # 3. Wiretap save to hard drive
                 filename = f"debug_chunk_{chunk_counter}.wav"
                 with open(filename, "wb") as f:
                     f.write(wav_bytes)
 
-                # 4. Encode and dispatch to AI
                 base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
                 asyncio.create_task(send_to_rawnet(base64_audio))
                 
-                # 5. Clear the buffer
                 audio_buffer.clear()
 
         except Exception as e:
             print(f"🛑 Audio stream ended or disconnected. Reason: {e}")
             break
 # -------------------------------
-
-
 
 @app.post("/offer")
 async def process_offer(params: Offer):
