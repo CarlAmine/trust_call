@@ -210,7 +210,7 @@ async def consume_audio_track(track):
                     context_memory.pop(0)
                     
                 # 5. Grab the last 9 seconds of context (last 3 chunks)
-                recent_context = " ".join(context_memory[-3:])
+                recent_context = " ".join(context_memory[-7:])
                 
                 # 6. Dispatch Parallel Fan-Out
                 asyncio.create_task(orchestrate_late_fusion(base64_audio, recent_context))
