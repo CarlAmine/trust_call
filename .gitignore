@@ -241,3 +241,9 @@ hf_cache/
 # Ignore Python environments and cache
 venv/
 __pycache__/
+
+
+
+custom_scam_model/
+results/
+checkpoint-*/
