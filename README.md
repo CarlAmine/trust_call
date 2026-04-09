@@ -227,3 +227,20 @@ Moving beyond keyword matching, we're fine-tuning `DistilBERT` on a domain-speci
 
 ---
 *Built for real-time, multi-modal threat detection. Phase 2 transforms reactive filtering into proactive, context-aware AI auditing.*
+
+
+
+
+# 🧠 Phase 3: Neural Semantic Fine-Tuning & Integration (DATE: 9/4/2026, AUTHOR: GEORGE HABIB)
+
+- Objective: Upgrade the Semantic Auditor from a basic Regex keyword-matcher to a deep learning text classifier capable of understanding manipulative intent and context.
+
+- Custom Model Fine-Tuning: Engineered a PyTorch training loop (train_model.py) using the Hugging Face Trainer API. We fine-tuned the distilbert-base-uncased model on a perfectly balanced, 2,500-row dataset of modern vishing transcripts and safe human conversations.
+
+- Anti-Overfitting Measures: Trained the model for 3 epochs with a load_best_model_at_end callback, automatically discarding overfitted epochs and securing a peak validation accuracy and F1 score of 99.0%.
+
+- Empirical QA Benchmarking: Developed a rigorous test suite (qa_model_comparison.py) pitting the legacy heuristic model against the new neural network using tricky edge cases (e.g., safe texts with "scary" keywords, or keyword-less emotional distress scams). The fine-tuned model demonstrated a 2x accuracy improvement (66.7% vs 33.3%) over the baseline.
+
+- Microservice Brain Transplant: Successfully migrated the ~260MB local model weights (.safetensors) directly into the distilbert-service directory, updating .gitignore protocols to safely bypass GitHub's 100MB file limits.
+
+- API Activation: Updated the main.py entry point to load the local custom model and flipped the USE_CLASSIFIER flag to True, officially switching the WebRTC pipeline's semantic analysis to the live neural network.
