@@ -1,0 +1,10 @@
+{
+  "target_sample_rate_hz": 16000,
+  "min_speech_seconds": 1.5,
+  "min_rms": 0.003,
+  "match_threshold": 0.82,
+  "review_threshold": 0.68,
+  "ema_alpha": 0.2,
+  "model_source": "speechbrain/spkrec-ecapa-voxceleb",
+  "model_savedir": "trust_call_backend/state/models/ecapa_voxceleb"
+}

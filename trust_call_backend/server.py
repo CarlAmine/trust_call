@@ -12,17 +12,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
+    from trust_call_backend.identity_config import load_identity_auditor_config
     from trust_call_backend.identity_auditor import (
         ECAPASpeakerEmbedder,
-        DEFAULT_EMA_ALPHA,
         IdentityAuditor,
         IdentityEnrollmentStore,
         IdentityResult,
     )
 except ModuleNotFoundError:
+    from identity_config import load_identity_auditor_config  # type: ignore
     from identity_auditor import (  # type: ignore
         ECAPASpeakerEmbedder,
-        DEFAULT_EMA_ALPHA,
         IdentityAuditor,
         IdentityEnrollmentStore,
         IdentityResult,
@@ -48,7 +48,7 @@ class IdentityEnrollmentPayload(BaseModel):
     caller_id: str
     base64_audio: str
     allow_update: bool = False
-    ema_alpha: float = DEFAULT_EMA_ALPHA
+    ema_alpha: float | None = None
 
 
 class IdentityVerificationPayload(BaseModel):
@@ -83,12 +83,17 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 state_root = Path(__file__).resolve().parent / "state"
+identity_config = load_identity_auditor_config()
 identity_store = IdentityEnrollmentStore(
     state_root / "identity_profiles"
 )
 identity_auditor = IdentityAuditor(
     store=identity_store,
-    embedder=ECAPASpeakerEmbedder(savedir=state_root / "models" / "ecapa_voxceleb"),
+    config=identity_config,
+    embedder=ECAPASpeakerEmbedder(
+        config=identity_config,
+        savedir=identity_config.resolve_model_savedir(),
+    ),
 )
 
 @app.websocket("/ws")
@@ -109,6 +114,11 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/identity/enrollment/{caller_id}")
 async def get_identity_enrollment_status(caller_id: str):
     return identity_auditor.get_enrollment_status(caller_id)
+
+
+@app.get("/identity/config")
+async def get_identity_config():
+    return identity_auditor.get_policy_snapshot()
 
 
 @app.post("/identity/enroll")

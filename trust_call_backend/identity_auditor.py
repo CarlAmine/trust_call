@@ -13,6 +13,11 @@ import numpy as np
 import soundfile as sf
 
 try:
+    from trust_call_backend.identity_config import IdentityAuditorConfig
+except ModuleNotFoundError:
+    from identity_config import IdentityAuditorConfig  # type: ignore
+
+try:
     import torch
 except ModuleNotFoundError:  # pragma: no cover - dependency installed at runtime
     torch = None  # type: ignore[assignment]
@@ -31,14 +36,25 @@ except ModuleNotFoundError:  # pragma: no cover - dependency installed at runtim
     LocalStrategy = None  # type: ignore[assignment]
 
 
-TARGET_SAMPLE_RATE = 16000
-MIN_SPEECH_SECONDS = 1.5
-MIN_RMS = 0.003
-DEFAULT_MATCH_THRESHOLD = 0.82
-DEFAULT_REVIEW_THRESHOLD = 0.68
-DEFAULT_EMA_ALPHA = 0.20
 EMBEDDER_NAME = "speechbrain_ecapa_tdnn_voxceleb"
 ECAPA_MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
+DEFAULT_IDENTITY_CONFIG = IdentityAuditorConfig()
+TARGET_SAMPLE_RATE = DEFAULT_IDENTITY_CONFIG.target_sample_rate_hz
+DEFAULT_MATCH_THRESHOLD = DEFAULT_IDENTITY_CONFIG.match_threshold
+DEFAULT_REVIEW_THRESHOLD = DEFAULT_IDENTITY_CONFIG.review_threshold
+DEFAULT_EMA_ALPHA = DEFAULT_IDENTITY_CONFIG.ema_alpha
+
+IDENTITY_STATUS_CONTRACT = {
+    "missing_caller_id": "No claimed identity was provided for the call.",
+    "not_enrolled": "No local identity profile exists for the claimed caller.",
+    "insufficient_audio": "The speech segment is too short for reliable verification.",
+    "low_energy": "The speech segment is too quiet for reliable verification.",
+    "profile_incompatible": "The stored profile was created with a different embedder.",
+    "model_unavailable": "The speaker verification model could not be loaded.",
+    "match": "The current speaker matches the enrolled profile.",
+    "review": "The current speaker is borderline and should be corroborated.",
+    "mismatch": "The current speaker does not match the enrolled profile.",
+}
 
 
 @dataclass
@@ -122,13 +138,15 @@ class IdentityEnrollmentStore:
 class ECAPASpeakerEmbedder:
     def __init__(
         self,
-        target_sample_rate: int = TARGET_SAMPLE_RATE,
-        model_source: str = ECAPA_MODEL_SOURCE,
+        config: IdentityAuditorConfig | None = None,
+        target_sample_rate: int | None = None,
+        model_source: str | None = None,
         savedir: Path | None = None,
         device: str | None = None,
     ):
-        self.target_sample_rate = target_sample_rate
-        self.model_source = model_source
+        self.config = config or DEFAULT_IDENTITY_CONFIG
+        self.target_sample_rate = target_sample_rate or self.config.target_sample_rate_hz
+        self.model_source = model_source or self.config.model_source or ECAPA_MODEL_SOURCE
         self.savedir = savedir
         self.device = device
         self._classifier = None
@@ -163,9 +181,9 @@ class ECAPASpeakerEmbedder:
         duration_seconds = len(waveform) / self.target_sample_rate
         rms = float(np.sqrt(np.mean(np.square(waveform)))) if waveform.size else 0.0
 
-        if duration_seconds < MIN_SPEECH_SECONDS:
+        if duration_seconds < self.config.min_speech_seconds:
             raise ValueError("insufficient_audio")
-        if rms < MIN_RMS:
+        if rms < self.config.min_rms:
             raise ValueError("low_energy")
         classifier = self._get_classifier()
         signal = torch.from_numpy(waveform).float().unsqueeze(0)
@@ -187,15 +205,21 @@ class IdentityAuditor:
     def __init__(
         self,
         store: IdentityEnrollmentStore,
+        config: IdentityAuditorConfig | None = None,
         embedder: ECAPASpeakerEmbedder | None = None,
-        match_threshold: float = DEFAULT_MATCH_THRESHOLD,
-        review_threshold: float = DEFAULT_REVIEW_THRESHOLD,
+        match_threshold: float | None = None,
+        review_threshold: float | None = None,
     ):
+        self.config = config or DEFAULT_IDENTITY_CONFIG
+        match_threshold = self.config.match_threshold if match_threshold is None else match_threshold
+        review_threshold = (
+            self.config.review_threshold if review_threshold is None else review_threshold
+        )
         if review_threshold >= match_threshold:
             raise ValueError("review_threshold must be lower than match_threshold")
 
         self.store = store
-        self.embedder = embedder or ECAPASpeakerEmbedder()
+        self.embedder = embedder or ECAPASpeakerEmbedder(config=self.config)
         self.match_threshold = match_threshold
         self.review_threshold = review_threshold
 
@@ -223,8 +247,10 @@ class IdentityAuditor:
         caller_id: str,
         base64_audio: str,
         allow_update: bool = False,
-        ema_alpha: float = DEFAULT_EMA_ALPHA,
+        ema_alpha: float | None = None,
     ) -> dict[str, Any]:
+        if ema_alpha is None:
+            ema_alpha = self.config.ema_alpha
         if not 0.0 < ema_alpha <= 1.0:
             raise ValueError("ema_alpha must be in the interval (0, 1]")
 
@@ -386,6 +412,19 @@ class IdentityAuditor:
     def verify_from_base64(self, caller_id: str, base64_audio: str) -> IdentityResult:
         audio, sample_rate = decode_base64_audio(base64_audio)
         return self.verify_chunk(caller_id=caller_id, audio=audio, sample_rate=sample_rate)
+
+    def get_policy_snapshot(self) -> dict[str, Any]:
+        return {
+            "embedder": self.embedder.name,
+            "model_source": self.embedder.model_source,
+            "target_sample_rate_hz": self.embedder.target_sample_rate,
+            "min_speech_seconds": self.config.min_speech_seconds,
+            "min_rms": self.config.min_rms,
+            "match_threshold": self.match_threshold,
+            "review_threshold": self.review_threshold,
+            "ema_alpha": self.config.ema_alpha,
+            "status_contract": IDENTITY_STATUS_CONTRACT,
+        }
 
 
 def decode_base64_audio(base64_audio: str) -> tuple[np.ndarray, int]:
