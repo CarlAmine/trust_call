@@ -12,6 +12,24 @@ from typing import Any
 import numpy as np
 import soundfile as sf
 
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - dependency installed at runtime
+    torch = None  # type: ignore[assignment]
+
+try:
+    from speechbrain.inference.speaker import EncoderClassifier as SpeechBrainEncoderClassifier
+except ModuleNotFoundError:  # pragma: no cover - fallback for older SpeechBrain
+    try:
+        from speechbrain.pretrained import EncoderClassifier as SpeechBrainEncoderClassifier  # type: ignore
+    except ModuleNotFoundError:  # pragma: no cover - dependency installed at runtime
+        SpeechBrainEncoderClassifier = None  # type: ignore[assignment]
+
+try:
+    from speechbrain.utils.fetching import LocalStrategy
+except ModuleNotFoundError:  # pragma: no cover - dependency installed at runtime
+    LocalStrategy = None  # type: ignore[assignment]
+
 
 TARGET_SAMPLE_RATE = 16000
 MIN_SPEECH_SECONDS = 1.5
@@ -19,7 +37,8 @@ MIN_RMS = 0.003
 DEFAULT_MATCH_THRESHOLD = 0.82
 DEFAULT_REVIEW_THRESHOLD = 0.68
 DEFAULT_EMA_ALPHA = 0.20
-EMBEDDER_NAME = "prototype_spectral_v1"
+EMBEDDER_NAME = "speechbrain_ecapa_tdnn_voxceleb"
+ECAPA_MODEL_SOURCE = "speechbrain/spkrec-ecapa-voxceleb"
 
 
 @dataclass
@@ -41,6 +60,21 @@ class IdentityResult:
             "identity_status": self.status,
             "identity_reason": self.reason,
             "identity_enrolled": self.enrolled,
+        }
+
+    def to_api_response(self) -> dict[str, Any]:
+        return {
+            "caller_id": self.caller_id,
+            "status": self.status,
+            "identity_score": round(self.identity_score, 4),
+            "similarity": round(self.similarity, 6) if self.similarity is not None else None,
+            "match_confidence": round(self.match_confidence, 6)
+            if self.match_confidence is not None
+            else None,
+            "display_text": self.display_text,
+            "reason": self.reason,
+            "enrolled": self.enrolled,
+            "duration_seconds": round(self.duration_seconds, 6),
         }
 
 
@@ -85,9 +119,44 @@ class IdentityEnrollmentStore:
         return True
 
 
-class PrototypeSpeakerEmbedder:
-    def __init__(self, target_sample_rate: int = TARGET_SAMPLE_RATE):
+class ECAPASpeakerEmbedder:
+    def __init__(
+        self,
+        target_sample_rate: int = TARGET_SAMPLE_RATE,
+        model_source: str = ECAPA_MODEL_SOURCE,
+        savedir: Path | None = None,
+        device: str | None = None,
+    ):
         self.target_sample_rate = target_sample_rate
+        self.model_source = model_source
+        self.savedir = savedir
+        self.device = device
+        self._classifier = None
+
+    @property
+    def name(self) -> str:
+        return EMBEDDER_NAME
+
+    def _get_classifier(self):
+        if self._classifier is not None:
+            return self._classifier
+        if torch is None or SpeechBrainEncoderClassifier is None:
+            raise RuntimeError("speaker_model_dependencies_missing")
+        if LocalStrategy is None:
+            raise RuntimeError("speaker_model_dependencies_missing")
+
+        run_device = self.device
+        if run_device is None:
+            run_device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        savedir = str(self.savedir) if self.savedir is not None else None
+        self._classifier = SpeechBrainEncoderClassifier.from_hparams(
+            source=self.model_source,
+            savedir=savedir,
+            local_strategy=LocalStrategy.COPY,
+            run_opts={"device": run_device},
+        )
+        return self._classifier
 
     def extract(self, audio: np.ndarray, sample_rate: int) -> tuple[np.ndarray, dict[str, float]]:
         waveform = _prepare_waveform(audio, sample_rate, self.target_sample_rate)
@@ -98,39 +167,11 @@ class PrototypeSpeakerEmbedder:
             raise ValueError("insufficient_audio")
         if rms < MIN_RMS:
             raise ValueError("low_energy")
-
-        frame_size = int(0.025 * self.target_sample_rate)
-        hop_size = int(0.010 * self.target_sample_rate)
-        if len(waveform) < frame_size:
-            raise ValueError("insufficient_audio")
-
-        frames = _frame_signal(waveform, frame_size, hop_size)
-        window = np.hanning(frame_size).astype(np.float32)
-        fft = np.fft.rfft(frames * window[None, :], n=512)
-        magnitude = np.abs(fft).astype(np.float32)
-        log_magnitude = np.log1p(magnitude)
-
-        spectral_profile = log_magnitude.mean(axis=0)[:96]
-        frame_energy = np.log1p(np.mean(np.square(frames), axis=1))
-        zero_cross_rate = np.mean(
-            np.abs(np.diff(np.signbit(frames), axis=1)), axis=1
-        ).astype(np.float32)
-
-        temporal_stats = np.array(
-            [
-                float(np.mean(frame_energy)),
-                float(np.std(frame_energy)),
-                float(np.mean(zero_cross_rate)),
-                float(np.std(zero_cross_rate)),
-                float(np.percentile(frame_energy, 25)),
-                float(np.percentile(frame_energy, 75)),
-            ],
-            dtype=np.float32,
-        )
-
-        embedding = np.concatenate([spectral_profile, temporal_stats], axis=0).astype(
-            np.float32
-        )
+        classifier = self._get_classifier()
+        signal = torch.from_numpy(waveform).float().unsqueeze(0)
+        lengths = torch.tensor([1.0], dtype=torch.float32)
+        embeddings = classifier.encode_batch(signal, lengths)
+        embedding = embeddings.detach().cpu().numpy().reshape(-1).astype(np.float32)
         embedding = _l2_normalize(embedding)
 
         metadata = {
@@ -146,7 +187,7 @@ class IdentityAuditor:
     def __init__(
         self,
         store: IdentityEnrollmentStore,
-        embedder: PrototypeSpeakerEmbedder | None = None,
+        embedder: ECAPASpeakerEmbedder | None = None,
         match_threshold: float = DEFAULT_MATCH_THRESHOLD,
         review_threshold: float = DEFAULT_REVIEW_THRESHOLD,
     ):
@@ -154,7 +195,7 @@ class IdentityAuditor:
             raise ValueError("review_threshold must be lower than match_threshold")
 
         self.store = store
-        self.embedder = embedder or PrototypeSpeakerEmbedder()
+        self.embedder = embedder or ECAPASpeakerEmbedder()
         self.match_threshold = match_threshold
         self.review_threshold = review_threshold
 
@@ -170,6 +211,7 @@ class IdentityAuditor:
             "caller_id": caller_id,
             "enrolled": True,
             "embedder": profile.get("embedder"),
+            "embedding_dim": profile.get("embedding_dim"),
             "created_at_utc": profile.get("created_at_utc"),
             "updated_at_utc": profile.get("updated_at_utc"),
             "num_updates": profile.get("num_updates", 0),
@@ -191,8 +233,12 @@ class IdentityAuditor:
 
         now = _utc_now()
         existing_profile = self.store.load(caller_id)
+        existing_is_compatible = (
+            existing_profile is not None
+            and existing_profile.get("embedder") == self.embedder.name
+        )
 
-        if existing_profile is not None and allow_update:
+        if existing_profile is not None and allow_update and existing_is_compatible:
             previous = np.array(existing_profile["embedding"], dtype=np.float32)
             blended = ((1.0 - ema_alpha) * previous) + (ema_alpha * embedding)
             embedding_to_store = _l2_normalize(blended).tolist()
@@ -205,8 +251,10 @@ class IdentityAuditor:
 
         payload = {
             "caller_id": caller_id,
-            "embedder": EMBEDDER_NAME,
+            "embedder": self.embedder.name,
+            "model_source": self.embedder.model_source,
             "embedding": embedding_to_store,
+            "embedding_dim": int(embedding.shape[0]),
             "created_at_utc": created_at,
             "updated_at_utc": now,
             "num_updates": num_updates,
@@ -218,12 +266,15 @@ class IdentityAuditor:
         return {
             "caller_id": caller_id,
             "enrolled": True,
-            "updated": existing_profile is not None and allow_update,
-            "embedder": EMBEDDER_NAME,
+            "updated": existing_profile is not None and allow_update and existing_is_compatible,
+            "embedder": self.embedder.name,
             "duration_seconds": metadata["duration_seconds"],
             "rms": metadata["rms"],
+            "embedding_dim": int(embedding.shape[0]),
             "num_updates": payload["num_updates"],
-            "ema_alpha": ema_alpha if existing_profile is not None and allow_update else None,
+            "ema_alpha": ema_alpha
+            if existing_profile is not None and allow_update and existing_is_compatible
+            else None,
         }
 
     def verify_chunk(
@@ -260,6 +311,18 @@ class IdentityAuditor:
                 enrolled=False,
                 duration_seconds=duration_seconds,
             )
+        if profile.get("embedder") != self.embedder.name:
+            return IdentityResult(
+                caller_id=caller_id,
+                status="profile_incompatible",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text="Re-enroll Required",
+                reason="stored_profile_model_mismatch",
+                enrolled=True,
+                duration_seconds=duration_seconds,
+            )
 
         try:
             embedding, _ = self.embedder.extract(audio, sample_rate)
@@ -275,6 +338,19 @@ class IdentityAuditor:
                 similarity=None,
                 match_confidence=None,
                 display_text=display_text,
+                reason=reason,
+                enrolled=True,
+                duration_seconds=duration_seconds,
+            )
+        except RuntimeError as exc:
+            reason = str(exc)
+            return IdentityResult(
+                caller_id=caller_id,
+                status="model_unavailable",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text="Model Unavailable",
                 reason=reason,
                 enrolled=True,
                 duration_seconds=duration_seconds,
@@ -306,6 +382,10 @@ class IdentityAuditor:
             enrolled=True,
             duration_seconds=duration_seconds,
         )
+
+    def verify_from_base64(self, caller_id: str, base64_audio: str) -> IdentityResult:
+        audio, sample_rate = decode_base64_audio(base64_audio)
+        return self.verify_chunk(caller_id=caller_id, audio=audio, sample_rate=sample_rate)
 
 
 def decode_base64_audio(base64_audio: str) -> tuple[np.ndarray, int]:
@@ -353,15 +433,6 @@ def _resample_linear(
     source_positions = np.linspace(0.0, duration, num=len(waveform), endpoint=False)
     target_positions = np.linspace(0.0, duration, num=target_length, endpoint=False)
     return np.interp(target_positions, source_positions, waveform).astype(np.float32)
-
-
-def _frame_signal(waveform: np.ndarray, frame_size: int, hop_size: int) -> np.ndarray:
-    frame_count = 1 + max((len(waveform) - frame_size) // hop_size, 0)
-    frames = np.zeros((frame_count, frame_size), dtype=np.float32)
-    for index in range(frame_count):
-        start = index * hop_size
-        frames[index] = waveform[start : start + frame_size]
-    return frames
 
 
 def _duration_seconds(audio: np.ndarray, sample_rate: int) -> float:

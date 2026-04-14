@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 try:
     from trust_call_backend.identity_auditor import (
+        ECAPASpeakerEmbedder,
         DEFAULT_EMA_ALPHA,
         IdentityAuditor,
         IdentityEnrollmentStore,
@@ -20,6 +21,7 @@ try:
     )
 except ModuleNotFoundError:
     from identity_auditor import (  # type: ignore
+        ECAPASpeakerEmbedder,
         DEFAULT_EMA_ALPHA,
         IdentityAuditor,
         IdentityEnrollmentStore,
@@ -49,6 +51,11 @@ class IdentityEnrollmentPayload(BaseModel):
     ema_alpha: float = DEFAULT_EMA_ALPHA
 
 
+class IdentityVerificationPayload(BaseModel):
+    caller_id: str
+    base64_audio: str
+
+
 # --- WEBSOCKET CONNECTION MANAGER ---
 class ConnectionManager:
     def __init__(self):
@@ -75,10 +82,14 @@ class ConnectionManager:
                 print(f"Failed to send websocket message: {e}")
 
 manager = ConnectionManager()
+state_root = Path(__file__).resolve().parent / "state"
 identity_store = IdentityEnrollmentStore(
-    Path(__file__).resolve().parent / "state" / "identity_profiles"
+    state_root / "identity_profiles"
 )
-identity_auditor = IdentityAuditor(store=identity_store)
+identity_auditor = IdentityAuditor(
+    store=identity_store,
+    embedder=ECAPASpeakerEmbedder(savedir=state_root / "models" / "ecapa_voxceleb"),
+)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -111,6 +122,22 @@ async def enroll_identity(payload: IdentityEnrollmentPayload):
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.post("/identity/verify")
+async def verify_identity(payload: IdentityVerificationPayload):
+    try:
+        result = identity_auditor.verify_from_base64(
+            caller_id=payload.caller_id,
+            base64_audio=payload.base64_audio,
+        )
+        return result.to_api_response()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.delete("/identity/enrollment/{caller_id}")
