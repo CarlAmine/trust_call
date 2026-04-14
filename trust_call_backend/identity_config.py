@@ -20,6 +20,11 @@ class IdentityAuditorConfig:
     match_threshold: float = 0.82
     review_threshold: float = 0.68
     ema_alpha: float = 0.20
+    require_safe_call_confirmation_for_enrollment: bool = True
+    require_safe_call_confirmation_for_update: bool = True
+    min_match_confidence_for_update: float = 0.90
+    max_synthetic_score_for_update: float = 0.35
+    max_coercion_score_for_update: float = 0.35
     model_source: str = "speechbrain/spkrec-ecapa-voxceleb"
     model_savedir: str = "trust_call_backend/state/models/ecapa_voxceleb"
 
@@ -36,6 +41,12 @@ class IdentityAuditorConfig:
             )
         if not 0.0 < self.ema_alpha <= 1.0:
             raise ValueError("ema_alpha must be in the interval (0, 1]")
+        if not 0.0 <= self.min_match_confidence_for_update <= 1.0:
+            raise ValueError("min_match_confidence_for_update must be in the interval [0, 1]")
+        if not 0.0 <= self.max_synthetic_score_for_update <= 1.0:
+            raise ValueError("max_synthetic_score_for_update must be in the interval [0, 1]")
+        if not 0.0 <= self.max_coercion_score_for_update <= 1.0:
+            raise ValueError("max_coercion_score_for_update must be in the interval [0, 1]")
         if not self.model_source.strip():
             raise ValueError("model_source must not be empty")
         if not self.model_savedir.strip():

@@ -9,7 +9,7 @@ import soundfile as sf
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from trust_call_backend.identity_config import load_identity_auditor_config
@@ -17,6 +17,7 @@ try:
         ECAPASpeakerEmbedder,
         IdentityAuditor,
         IdentityEnrollmentStore,
+        IdentityPolicyError,
         IdentityResult,
     )
 except ModuleNotFoundError:
@@ -25,6 +26,7 @@ except ModuleNotFoundError:
         ECAPASpeakerEmbedder,
         IdentityAuditor,
         IdentityEnrollmentStore,
+        IdentityPolicyError,
         IdentityResult,
     )
 
@@ -49,6 +51,10 @@ class IdentityEnrollmentPayload(BaseModel):
     base64_audio: str
     allow_update: bool = False
     ema_alpha: float | None = None
+    safe_to_enroll: bool = False
+    safe_to_update: bool = False
+    synthetic_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    coercion_score: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class IdentityVerificationPayload(BaseModel):
@@ -129,7 +135,13 @@ async def enroll_identity(payload: IdentityEnrollmentPayload):
             base64_audio=payload.base64_audio,
             allow_update=payload.allow_update,
             ema_alpha=payload.ema_alpha,
+            safe_to_enroll=payload.safe_to_enroll,
+            safe_to_update=payload.safe_to_update,
+            synthetic_score=payload.synthetic_score,
+            coercion_score=payload.coercion_score,
         )
+    except IdentityPolicyError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.to_response()) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:

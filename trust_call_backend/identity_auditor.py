@@ -56,6 +56,41 @@ IDENTITY_STATUS_CONTRACT = {
     "mismatch": "The current speaker does not match the enrolled profile.",
 }
 
+IDENTITY_POLICY_CONTRACT = {
+    "require_safe_call_confirmation_for_enrollment": (
+        "Initial TOFU enrollment requires an explicitly trusted safe call."
+    ),
+    "require_safe_call_confirmation_for_update": (
+        "EMA profile updates require an explicitly trusted safe call."
+    ),
+    "min_match_confidence_for_update": (
+        "Profile updates require strong identity agreement before blending."
+    ),
+    "max_synthetic_score_for_update": (
+        "Profile updates are blocked when synthetic-speech risk is too high."
+    ),
+    "max_coercion_score_for_update": (
+        "Profile updates are blocked when coercion risk is too high."
+    ),
+    "existing_profile_requires_update_mode": (
+        "Existing profiles cannot be overwritten unless update mode is explicitly requested."
+    ),
+}
+
+
+class IdentityPolicyError(ValueError):
+    def __init__(self, code: str, message: str, http_status: int = 400):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+
+    def to_response(self) -> dict[str, Any]:
+        return {
+            "error": self.code,
+            "message": self.message,
+        }
+
 
 @dataclass
 class IdentityResult:
@@ -248,32 +283,102 @@ class IdentityAuditor:
         base64_audio: str,
         allow_update: bool = False,
         ema_alpha: float | None = None,
+        safe_to_enroll: bool = False,
+        safe_to_update: bool = False,
+        synthetic_score: float | None = None,
+        coercion_score: float | None = None,
     ) -> dict[str, Any]:
         if ema_alpha is None:
             ema_alpha = self.config.ema_alpha
         if not 0.0 < ema_alpha <= 1.0:
             raise ValueError("ema_alpha must be in the interval (0, 1]")
+        synthetic_score = _validate_optional_unit_interval("synthetic_score", synthetic_score)
+        coercion_score = _validate_optional_unit_interval("coercion_score", coercion_score)
 
-        audio, sample_rate = decode_base64_audio(base64_audio)
-        embedding, metadata = self.embedder.extract(audio, sample_rate)
-
-        now = _utc_now()
         existing_profile = self.store.load(caller_id)
         existing_is_compatible = (
             existing_profile is not None
             and existing_profile.get("embedder") == self.embedder.name
         )
 
-        if existing_profile is not None and allow_update and existing_is_compatible:
-            previous = np.array(existing_profile["embedding"], dtype=np.float32)
+        mode = "initial_enrollment"
+        pre_update_match_confidence = None
+
+        if existing_profile is None:
+            if allow_update:
+                raise IdentityPolicyError(
+                    code="update_requires_existing_profile",
+                    message="EMA update requested but no existing profile was found.",
+                    http_status=409,
+                )
+            if self.config.require_safe_call_confirmation_for_enrollment and not safe_to_enroll:
+                raise IdentityPolicyError(
+                    code="tofu_requires_safe_call_confirmation",
+                    message="TOFU enrollment is blocked until the call is explicitly marked safe.",
+                    http_status=403,
+                )
+        else:
+            if not allow_update:
+                raise IdentityPolicyError(
+                    code="identity_profile_already_exists",
+                    message="A profile already exists for this caller. Delete it first or use update mode.",
+                    http_status=409,
+                )
+            if not existing_is_compatible:
+                raise IdentityPolicyError(
+                    code="profile_incompatible_reenroll_required",
+                    message="The stored profile was created with a different embedder. Re-enroll after deleting the old profile.",
+                    http_status=409,
+                )
+            if self.config.require_safe_call_confirmation_for_update and not safe_to_update:
+                raise IdentityPolicyError(
+                    code="ema_update_requires_safe_call_confirmation",
+                    message="EMA update is blocked until the call is explicitly marked safe.",
+                    http_status=403,
+                )
+            if (
+                synthetic_score is not None
+                and synthetic_score > self.config.max_synthetic_score_for_update
+            ):
+                raise IdentityPolicyError(
+                    code="ema_update_blocked_by_synthetic_risk",
+                    message="EMA update is blocked because the synthetic-speech risk is too high.",
+                    http_status=403,
+                )
+            if (
+                coercion_score is not None
+                and coercion_score > self.config.max_coercion_score_for_update
+            ):
+                raise IdentityPolicyError(
+                    code="ema_update_blocked_by_coercion_risk",
+                    message="EMA update is blocked because the coercion risk is too high.",
+                    http_status=403,
+                )
+
+        audio, sample_rate = decode_base64_audio(base64_audio)
+        embedding, metadata = self.embedder.extract(audio, sample_rate)
+        now = _utc_now()
+
+        if existing_profile is None:
+            embedding_to_store = embedding.tolist()
+            created_at = now
+            num_updates = 0
+        else:
+            previous = _l2_normalize(np.array(existing_profile["embedding"], dtype=np.float32))
+            pre_similarity = float(np.dot(previous, embedding))
+            pre_update_match_confidence = float(np.clip((pre_similarity + 1.0) / 2.0, 0.0, 1.0))
+            if pre_update_match_confidence < self.config.min_match_confidence_for_update:
+                raise IdentityPolicyError(
+                    code="ema_update_blocked_by_identity_mismatch",
+                    message="EMA update is blocked because the new sample does not match the enrolled profile strongly enough.",
+                    http_status=403,
+                )
+
             blended = ((1.0 - ema_alpha) * previous) + (ema_alpha * embedding)
             embedding_to_store = _l2_normalize(blended).tolist()
             created_at = existing_profile.get("created_at_utc", now)
             num_updates = int(existing_profile.get("num_updates", 0)) + 1
-        else:
-            embedding_to_store = embedding.tolist()
-            created_at = now
-            num_updates = 0
+            mode = "ema_update"
 
         payload = {
             "caller_id": caller_id,
@@ -292,14 +397,24 @@ class IdentityAuditor:
         return {
             "caller_id": caller_id,
             "enrolled": True,
-            "updated": existing_profile is not None and allow_update and existing_is_compatible,
+            "mode": mode,
+            "updated": mode == "ema_update",
             "embedder": self.embedder.name,
             "duration_seconds": metadata["duration_seconds"],
             "rms": metadata["rms"],
             "embedding_dim": int(embedding.shape[0]),
             "num_updates": payload["num_updates"],
+            "safe_to_enroll": safe_to_enroll,
+            "safe_to_update": safe_to_update,
+            "synthetic_score": synthetic_score,
+            "coercion_score": coercion_score,
+            "pre_update_match_confidence": (
+                round(pre_update_match_confidence, 6)
+                if pre_update_match_confidence is not None
+                else None
+            ),
             "ema_alpha": ema_alpha
-            if existing_profile is not None and allow_update and existing_is_compatible
+            if mode == "ema_update"
             else None,
         }
 
@@ -423,7 +538,17 @@ class IdentityAuditor:
             "match_threshold": self.match_threshold,
             "review_threshold": self.review_threshold,
             "ema_alpha": self.config.ema_alpha,
+            "require_safe_call_confirmation_for_enrollment": (
+                self.config.require_safe_call_confirmation_for_enrollment
+            ),
+            "require_safe_call_confirmation_for_update": (
+                self.config.require_safe_call_confirmation_for_update
+            ),
+            "min_match_confidence_for_update": self.config.min_match_confidence_for_update,
+            "max_synthetic_score_for_update": self.config.max_synthetic_score_for_update,
+            "max_coercion_score_for_update": self.config.max_coercion_score_for_update,
             "status_contract": IDENTITY_STATUS_CONTRACT,
+            "policy_contract": IDENTITY_POLICY_CONTRACT,
         }
 
 
@@ -490,6 +615,15 @@ def _l2_normalize(vector: np.ndarray) -> np.ndarray:
     if norm == 0.0:
         raise ValueError("zero_norm_embedding")
     return (vector / norm).astype(np.float32)
+
+
+def _validate_optional_unit_interval(name: str, value: float | None) -> float | None:
+    if value is None:
+        return None
+    numeric = float(value)
+    if not 0.0 <= numeric <= 1.0:
+        raise ValueError(f"{name} must be in the interval [0, 1]")
+    return numeric
 
 
 def _utc_now() -> str:
