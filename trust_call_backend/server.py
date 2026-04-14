@@ -1,16 +1,30 @@
 import asyncio
-import numpy as np
-from fastapi import FastAPI
-from pydantic import BaseModel
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-
-import io
 import base64
+import io
+from pathlib import Path
+
 import httpx
+import numpy as np
 import soundfile as sf
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+try:
+    from trust_call_backend.identity_auditor import (
+        DEFAULT_EMA_ALPHA,
+        IdentityAuditor,
+        IdentityEnrollmentStore,
+        IdentityResult,
+    )
+except ModuleNotFoundError:
+    from identity_auditor import (  # type: ignore
+        DEFAULT_EMA_ALPHA,
+        IdentityAuditor,
+        IdentityEnrollmentStore,
+        IdentityResult,
+    )
 
 app = FastAPI()
 
@@ -25,6 +39,14 @@ app.add_middleware(
 class Offer(BaseModel):
     sdp: str
     type: str
+    caller_id: str = "unknown"
+
+
+class IdentityEnrollmentPayload(BaseModel):
+    caller_id: str
+    base64_audio: str
+    allow_update: bool = False
+    ema_alpha: float = DEFAULT_EMA_ALPHA
 
 
 # --- WEBSOCKET CONNECTION MANAGER ---
@@ -53,6 +75,10 @@ class ConnectionManager:
                 print(f"Failed to send websocket message: {e}")
 
 manager = ConnectionManager()
+identity_store = IdentityEnrollmentStore(
+    Path(__file__).resolve().parent / "state" / "identity_profiles"
+)
+identity_auditor = IdentityAuditor(store=identity_store)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -69,9 +95,48 @@ async def websocket_endpoint(websocket: WebSocket):
     except Exception as e:
         print(f"⚠️ WebSocket Crash: {e}")
 
-async def send_to_rawnet(base64_audio: str):
+@app.get("/identity/enrollment/{caller_id}")
+async def get_identity_enrollment_status(caller_id: str):
+    return identity_auditor.get_enrollment_status(caller_id)
+
+
+@app.post("/identity/enroll")
+async def enroll_identity(payload: IdentityEnrollmentPayload):
+    try:
+        return identity_auditor.enroll_from_base64(
+            caller_id=payload.caller_id,
+            base64_audio=payload.base64_audio,
+            allow_update=payload.allow_update,
+            ema_alpha=payload.ema_alpha,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/identity/enrollment/{caller_id}")
+async def delete_identity_enrollment(caller_id: str):
+    deleted = identity_store.delete(caller_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
+    return {
+        "caller_id": caller_id,
+        "deleted": True,
+    }
+
+
+def build_fusion_status(identity_result: IdentityResult) -> str:
+    if identity_result.status == "mismatch":
+        return "IDENTITY REVIEW"
+    if identity_result.status == "review":
+        return "IDENTITY CAUTION"
+    return "ANALYZING"
+
+
+async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult):
     """Sends the audio to the RawNet2 microservice in the background."""
     payload = {"base64_audio": base64_audio}
+    signal_score = "Signal Unavailable"
+    is_threat = False
     try:
         # We use AsyncClient so it doesn't block the live WebRTC stream
         async with httpx.AsyncClient() as client:
@@ -90,23 +155,25 @@ async def send_to_rawnet(base64_audio: str):
                 
                 # 3. Calculate the threat using the safe float numbers
                 is_threat = spoof_float > 50.0 
-                display_text = f"{spoof_float}% AI (Deepfake)" if is_threat else f"{real_float}% Human"
-                
-                await manager.broadcast({
-                    "signal_score": display_text,
-                    "is_threat": is_threat, 
-                    "semantic_intent": "Low Risk", 
-                    "identity_match": "Pending...", 
-                    "fusion_status": "ANALYZING"
-                })
+                signal_score = (
+                    f"{spoof_float}% AI (Deepfake)" if is_threat else f"{real_float}% Human"
+                )
             else:
                 print(f"❌ AI Server Error: {response.text}")
                 
     except Exception as e:
         print(f"❌ Failed to reach AI server. Is it running on port 8000? Error: {e}")
+    finally:
+        await manager.broadcast({
+            "signal_score": signal_score,
+            "is_threat": is_threat,
+            "semantic_intent": "Low Risk",
+            "fusion_status": build_fusion_status(identity_result),
+            **identity_result.to_telemetry(),
+        })
 
 # --- THE AUDIO BUFFER ENGINE ---
-async def consume_audio_track(track):
+async def consume_audio_track(track, caller_id: str):
     print("🎙️ Audio buffer engine started! Waiting for frames...")
     audio_buffer = []
     sample_rate = 0
@@ -158,13 +225,19 @@ async def consume_audio_track(track):
                 wav_io = io.BytesIO()
                 sf.write(wav_io, combined_audio, sample_rate, format='WAV', subtype='PCM_16')
                 wav_bytes = wav_io.getvalue()
-                
+
+                identity_result = identity_auditor.verify_chunk(
+                    caller_id=caller_id,
+                    audio=combined_audio,
+                    sample_rate=sample_rate,
+                )
+
                 filename = f"debug_chunk_{chunk_counter}.wav"
                 with open(filename, "wb") as f:
                     f.write(wav_bytes)
 
                 base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
-                asyncio.create_task(send_to_rawnet(base64_audio))
+                asyncio.create_task(send_to_rawnet(base64_audio, identity_result))
                 
                 audio_buffer.clear()
 
@@ -184,7 +257,7 @@ async def process_offer(params: Offer):
     def on_track(track):
         print("🟢 Live Audio track connected!")
         # Spin up our buffer engine in the background the moment the track connects
-        asyncio.ensure_future(consume_audio_track(track))
+        asyncio.ensure_future(consume_audio_track(track, params.caller_id))
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
