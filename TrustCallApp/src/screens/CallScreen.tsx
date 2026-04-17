@@ -17,7 +17,11 @@ const CallScreen = ({ navigation, route }: any) => {
   const [signalScore, setSignalScore] = useState<string>('Analyzing...');
   const [semanticStatus, setSemanticStatus] = useState<string>('Pending...');
   const [identityStatus, setIdentityStatus] = useState<string>('Pending...');
+  const [identityConfidence, setIdentityConfidence] = useState<string>('Pending...');
+  const [identityChunks, setIdentityChunks] = useState<number>(0);
+  const [identityReason, setIdentityReason] = useState<string>('Awaiting live audio...');
   const [fusionStatus, setFusionStatus] = useState<string>('WAITING');
+  const [sessionId, setSessionId] = useState<string>('Not Connected');
 
   const [signalColor, setSignalColor] = useState<string>('#4CAF50'); // Default Green
 
@@ -88,8 +92,14 @@ const CallScreen = ({ navigation, route }: any) => {
 
         const answer = await response.json();
         console.log('5. Received Answer from Python Server!');
+        setSessionId(answer.session_id ?? 'Unknown Session');
 
-        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        await pc.setRemoteDescription(
+          new RTCSessionDescription({
+            sdp: answer.sdp,
+            type: answer.type,
+          })
+        );
         console.log('🟢 HANDSHAKE COMPLETE! Live audio is now flowing to Python.');
 
         // --- THE FIX 2: Open the WebSocket strictly AFTER audio is flowing ---
@@ -108,6 +118,15 @@ const CallScreen = ({ navigation, route }: any) => {
 
             setSemanticStatus(data.semantic_intent);
             setIdentityStatus(data.identity_match);
+            setIdentityConfidence(
+              data.identity_match_confidence != null
+                ? `${(Number(data.identity_match_confidence) * 100).toFixed(1)}%`
+                : 'Pending...'
+            );
+            setIdentityChunks(
+              typeof data.identity_chunk_count === 'number' ? data.identity_chunk_count : 0
+            );
+            setIdentityReason(data.identity_reason ?? 'No runtime issue reported');
             setFusionStatus(data.fusion_status);
           } catch (error) {
             console.error("Error parsing telemetry data", error);
@@ -168,6 +187,7 @@ const handleAcceptCall = () => {
       <View style={styles.header}>
         <Text style={styles.callerName}>{callerName}</Text>
         <Text style={styles.callTime}>{formatTime(callDuration)}</Text>
+        <Text style={styles.sessionMeta}>Session: {sessionId}</Text>
       </View>
 
       <View style={styles.telemetryBoard}>
@@ -186,6 +206,21 @@ const handleAcceptCall = () => {
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Identity (ECAPA):</Text>
           <Text style={styles.metricValueWarning}>{identityStatus}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Identity Confidence:</Text>
+          <Text style={styles.metricValueSafe}>{identityConfidence}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Identity Chunks:</Text>
+          <Text style={styles.metricValueSafe}>{identityChunks}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Identity Reason:</Text>
+          <Text style={styles.metricValueSubtle}>{identityReason}</Text>
         </View>
       </View>
 
@@ -220,6 +255,7 @@ const styles = StyleSheet.create({
   header: { alignItems: 'center', marginTop: 40, marginBottom: 40 },
   callerName: { color: '#FFF', fontSize: 32, fontWeight: 'bold' },
   callTime: { color: '#888', fontSize: 18, marginTop: 10 },
+  sessionMeta: { color: '#666', fontSize: 12, marginTop: 8 },
   
   telemetryBoard: { backgroundColor: '#1A1A1A', padding: 20, borderRadius: 15, borderWidth: 1, borderColor: '#333' },
   boardTitle: { color: '#555', fontSize: 12, textTransform: 'uppercase', marginBottom: 15, letterSpacing: 1 },
@@ -227,6 +263,7 @@ const styles = StyleSheet.create({
   metricLabel: { color: '#CCC', fontSize: 16 },
   metricValueSafe: { color: '#4CAF50', fontSize: 16, fontWeight: 'bold' },
   metricValueWarning: { color: '#FFC107', fontSize: 16, fontWeight: 'bold' },
+  metricValueSubtle: { color: '#AAA', fontSize: 14, fontWeight: '500', flexShrink: 1, textAlign: 'right', maxWidth: '55%' },
   
   decisionEngine: { alignItems: 'center', marginTop: 40 },
   decisionLabel: { color: '#888', fontSize: 14, textTransform: 'uppercase' },

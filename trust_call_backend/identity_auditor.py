@@ -106,7 +106,17 @@ class IdentityResult:
 
     def to_telemetry(self) -> dict[str, Any]:
         return {
+            "caller_id": self.caller_id,
             "identity_score": round(self.identity_score, 4),
+            "identity_similarity": (
+                round(self.similarity, 6) if self.similarity is not None else None
+            ),
+            "identity_match_confidence": (
+                round(self.match_confidence, 6)
+                if self.match_confidence is not None
+                else None
+            ),
+            "identity_duration_seconds": round(self.duration_seconds, 6),
             "identity_match": self.display_text,
             "identity_status": self.status,
             "identity_reason": self.reason,

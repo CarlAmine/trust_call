@@ -1,7 +1,10 @@
 import asyncio
 import base64
 import io
+from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import numpy as np
@@ -19,6 +22,7 @@ try:
         IdentityEnrollmentStore,
         IdentityPolicyError,
         IdentityResult,
+        decode_base64_audio,
     )
 except ModuleNotFoundError:
     from identity_config import load_identity_auditor_config  # type: ignore
@@ -28,6 +32,7 @@ except ModuleNotFoundError:
         IdentityEnrollmentStore,
         IdentityPolicyError,
         IdentityResult,
+        decode_base64_audio,
     )
 
 app = FastAPI()
@@ -39,6 +44,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 class Offer(BaseModel):
     sdp: str
@@ -62,7 +68,13 @@ class IdentityVerificationPayload(BaseModel):
     base64_audio: str
 
 
-# --- WEBSOCKET CONNECTION MANAGER ---
+class LiveIdentityValidationPayload(BaseModel):
+    caller_id: str
+    base64_audio: str
+    session_id: str | None = None
+    dispatch_signal_auditor: bool = False
+
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: list[WebSocket] = []
@@ -76,23 +88,153 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: dict):
-        # --- THE FIX: Warn us if the array is empty! ---
-        if len(self.active_connections) == 0:
-            print("⚠️ WARNING: AI graded the audio, but no phone is connected to the WebSocket!")
+        if not self.active_connections:
+            print("WARNING: Telemetry event emitted without an attached WebSocket client.")
             return
-        # -----------------------------------------------
-        for connection in self.active_connections:
+
+        for connection in list(self.active_connections):
             try:
                 await connection.send_json(message)
-            except Exception as e:
-                print(f"Failed to send websocket message: {e}")
+            except Exception as exc:
+                print(f"Failed to send websocket message: {exc}")
+
+
+class LiveIdentityMonitor:
+    def __init__(self, max_sessions: int = 20, max_events_per_session: int = 8):
+        self.max_sessions = max_sessions
+        self.max_events_per_session = max_events_per_session
+        self._sessions: dict[str, dict] = {}
+        self._order: deque[str] = deque()
+
+    def start_session(self, caller_id: str, source: str) -> dict:
+        session_id = str(uuid4())
+        now = _utc_now()
+        session = {
+            "session_id": session_id,
+            "caller_id": caller_id,
+            "source": source,
+            "state": "offer_received" if source == "webrtc" else "validation_started",
+            "created_at_utc": now,
+            "last_updated_at_utc": now,
+            "track_connected_at_utc": None,
+            "sample_rate_hz": None,
+            "chunks_processed": 0,
+            "last_chunk_peak": None,
+            "last_chunk_duration_seconds": None,
+            "last_identity_result": None,
+            "recent_identity_events": [],
+            "last_signal_score": None,
+            "last_signal_threat": None,
+            "last_error": None,
+        }
+        self._sessions[session_id] = session
+        self._order.append(session_id)
+        while len(self._order) > self.max_sessions:
+            evicted = self._order.popleft()
+            self._sessions.pop(evicted, None)
+        return session
+
+    def mark_track_connected(self, session_id: str) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session["track_connected_at_utc"] = _utc_now()
+        session["state"] = "track_connected"
+        session["last_updated_at_utc"] = session["track_connected_at_utc"]
+
+    def record_chunk(
+        self,
+        session_id: str,
+        identity_result: IdentityResult,
+        sample_rate: int,
+        chunk_peak: float,
+    ) -> dict | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+
+        now = _utc_now()
+        chunk_index = int(session["chunks_processed"]) + 1
+        event = {
+            "chunk_index": chunk_index,
+            "processed_at_utc": now,
+            "sample_rate_hz": sample_rate,
+            "chunk_peak": round(float(chunk_peak), 4),
+            **identity_result.to_api_response(),
+        }
+        session["chunks_processed"] = chunk_index
+        session["sample_rate_hz"] = sample_rate
+        session["last_chunk_peak"] = event["chunk_peak"]
+        session["last_chunk_duration_seconds"] = event["duration_seconds"]
+        session["last_identity_result"] = event
+        session["state"] = "identity_verified"
+        session["last_updated_at_utc"] = now
+
+        recent_events = session["recent_identity_events"]
+        recent_events.append(event)
+        if len(recent_events) > self.max_events_per_session:
+            del recent_events[0 : len(recent_events) - self.max_events_per_session]
+        return event
+
+    def record_signal_result(self, session_id: str, signal_score: str, is_threat: bool) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session["last_signal_score"] = signal_score
+        session["last_signal_threat"] = bool(is_threat)
+        session["state"] = "telemetry_broadcast"
+        session["last_updated_at_utc"] = _utc_now()
+
+    def record_error(self, session_id: str, error: str) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session["last_error"] = error
+        session["state"] = "error"
+        session["last_updated_at_utc"] = _utc_now()
+
+    def list_sessions(self) -> list[dict]:
+        sessions = [self._sessions[session_id] for session_id in reversed(self._order)]
+        return [self._summary(session) for session in sessions]
+
+    def get_session(self, session_id: str) -> dict | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        return {
+            **self._summary(session),
+            "last_signal_score": session["last_signal_score"],
+            "last_signal_threat": session["last_signal_threat"],
+            "last_error": session["last_error"],
+            "recent_identity_events": list(session["recent_identity_events"]),
+        }
+
+    def _summary(self, session: dict) -> dict:
+        return {
+            "session_id": session["session_id"],
+            "caller_id": session["caller_id"],
+            "source": session["source"],
+            "state": session["state"],
+            "created_at_utc": session["created_at_utc"],
+            "last_updated_at_utc": session["last_updated_at_utc"],
+            "track_connected_at_utc": session["track_connected_at_utc"],
+            "sample_rate_hz": session["sample_rate_hz"],
+            "chunks_processed": session["chunks_processed"],
+            "last_chunk_peak": session["last_chunk_peak"],
+            "last_chunk_duration_seconds": session["last_chunk_duration_seconds"],
+            "last_identity_result": session["last_identity_result"],
+        }
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 manager = ConnectionManager()
+live_identity_monitor = LiveIdentityMonitor()
 state_root = Path(__file__).resolve().parent / "state"
 identity_config = load_identity_auditor_config()
-identity_store = IdentityEnrollmentStore(
-    state_root / "identity_profiles"
-)
+identity_store = IdentityEnrollmentStore(state_root / "identity_profiles")
 identity_auditor = IdentityAuditor(
     store=identity_store,
     config=identity_config,
@@ -102,20 +244,21 @@ identity_auditor = IdentityAuditor(
     ),
 )
 
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    print("\n👀 INCOMING WEBSOCKET CONNECTION...")
+    print("Incoming WebSocket connection.")
     await manager.connect(websocket)
-    print("✅ WEBSOCKET ACCEPTED AND LOCKED IN!\n")
+    print("WebSocket accepted.")
     try:
         while True:
-            # Keep the connection open waiting for the client
-            data = await websocket.receive_text()
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
-        print("🛑 WebSocket Client Disconnected")
-    except Exception as e:
-        print(f"⚠️ WebSocket Crash: {e}")
+        print("WebSocket client disconnected.")
+    except Exception as exc:
+        print(f"WebSocket crashed: {exc}")
+
 
 @app.get("/identity/enrollment/{caller_id}")
 async def get_identity_enrollment_status(caller_id: str):
@@ -125,6 +268,23 @@ async def get_identity_enrollment_status(caller_id: str):
 @app.get("/identity/config")
 async def get_identity_config():
     return identity_auditor.get_policy_snapshot()
+
+
+@app.get("/identity/live/sessions")
+async def list_live_identity_sessions():
+    sessions = live_identity_monitor.list_sessions()
+    return {
+        "count": len(sessions),
+        "sessions": sessions,
+    }
+
+
+@app.get("/identity/live/sessions/{session_id}")
+async def get_live_identity_session(session_id: str):
+    session = live_identity_monitor.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Live identity session not found")
+    return session
 
 
 @app.post("/identity/enroll")
@@ -162,6 +322,39 @@ async def verify_identity(payload: IdentityVerificationPayload):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.post("/identity/live/validate")
+async def validate_live_identity_chunk(payload: LiveIdentityValidationPayload):
+    try:
+        session = (
+            live_identity_monitor.get_session(payload.session_id)
+            if payload.session_id
+            else None
+        )
+        if session is None:
+            session = live_identity_monitor.start_session(
+                caller_id=payload.caller_id,
+                source="live_validation",
+            )
+
+        audio, sample_rate = decode_base64_audio(payload.base64_audio)
+        identity_result = await process_identity_chunk(
+            caller_id=payload.caller_id,
+            audio=audio,
+            sample_rate=sample_rate,
+            session_id=session["session_id"],
+            dispatch_signal_auditor=payload.dispatch_signal_auditor,
+        )
+        return {
+            "session_id": session["session_id"],
+            "identity": identity_result.to_api_response(),
+            "session": live_identity_monitor.get_session(session["session_id"]),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.delete("/identity/enrollment/{caller_id}")
 async def delete_identity_enrollment(caller_id: str):
     deleted = identity_store.delete(caller_id)
@@ -181,60 +374,93 @@ def build_fusion_status(identity_result: IdentityResult) -> str:
     return "ANALYZING"
 
 
-async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult):
-    """Sends the audio to the RawNet2 microservice in the background."""
+async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult, session_id: str):
     payload = {"base64_audio": base64_audio}
     signal_score = "Signal Unavailable"
     is_threat = False
+
     try:
-        # We use AsyncClient so it doesn't block the live WebRTC stream
         async with httpx.AsyncClient() as client:
-            response = await client.post("http://127.0.0.1:8000/predict", json=payload, timeout=5.0)
-            
+            response = await client.post(
+                "http://127.0.0.1:8000/predict",
+                json=payload,
+                timeout=5.0,
+            )
             if response.status_code == 200:
                 data = response.json()
-                spoof_raw = data.get('spoof_probability_percent')
-                real_raw = data.get('real_probability_percent')
-                
-                # 2. FORCE them to be floats so Python doesn't crash during math!
-                spoof_float = float(spoof_raw)
-                real_float = float(real_raw)
-                
-                print(f"🤖 [AI AUDITOR] -> AI: {spoof_float}% | Human: {real_float}%")
-                
-                # 3. Calculate the threat using the safe float numbers
-                is_threat = spoof_float > 50.0 
+                spoof_float = float(data.get("spoof_probability_percent", 0.0))
+                real_float = float(data.get("real_probability_percent", 0.0))
+                print(f"[AI AUDITOR] AI: {spoof_float}% | Human: {real_float}%")
+                is_threat = spoof_float > 50.0
                 signal_score = (
-                    f"{spoof_float}% AI (Deepfake)" if is_threat else f"{real_float}% Human"
+                    f"{spoof_float}% AI (Deepfake)"
+                    if is_threat
+                    else f"{real_float}% Human"
                 )
             else:
-                print(f"❌ AI Server Error: {response.text}")
-                
-    except Exception as e:
-        print(f"❌ Failed to reach AI server. Is it running on port 8000? Error: {e}")
+                print(f"AI server error: {response.text}")
+    except Exception as exc:
+        print(f"Failed to reach AI server on port 8000: {exc}")
     finally:
-        await manager.broadcast({
-            "signal_score": signal_score,
-            "is_threat": is_threat,
-            "semantic_intent": "Low Risk",
-            "fusion_status": build_fusion_status(identity_result),
-            **identity_result.to_telemetry(),
-        })
+        live_identity_monitor.record_signal_result(session_id, signal_score, is_threat)
+        session = live_identity_monitor.get_session(session_id)
+        await manager.broadcast(
+            {
+                "session_id": session_id,
+                "caller_id": identity_result.caller_id,
+                "signal_score": signal_score,
+                "is_threat": is_threat,
+                "semantic_intent": "Low Risk",
+                "fusion_status": build_fusion_status(identity_result),
+                "identity_chunk_count": (
+                    session["chunks_processed"] if session is not None else None
+                ),
+                **identity_result.to_telemetry(),
+            }
+        )
 
-# --- THE AUDIO BUFFER ENGINE ---
-async def consume_audio_track(track, caller_id: str):
-    print("🎙️ Audio buffer engine started! Waiting for frames...")
+
+async def process_identity_chunk(
+    caller_id: str,
+    audio: np.ndarray,
+    sample_rate: int,
+    session_id: str,
+    dispatch_signal_auditor: bool = True,
+) -> IdentityResult:
+    identity_result = identity_auditor.verify_chunk(
+        caller_id=caller_id,
+        audio=audio,
+        sample_rate=sample_rate,
+    )
+    chunk_peak = float(np.max(np.abs(np.asarray(audio)))) if np.asarray(audio).size else 0.0
+    live_identity_monitor.record_chunk(
+        session_id=session_id,
+        identity_result=identity_result,
+        sample_rate=sample_rate,
+        chunk_peak=chunk_peak,
+    )
+
+    if dispatch_signal_auditor:
+        wav_io = io.BytesIO()
+        sf.write(wav_io, audio, sample_rate, format="WAV", subtype="PCM_16")
+        wav_bytes = wav_io.getvalue()
+        base64_audio = base64.b64encode(wav_bytes).decode("utf-8")
+        asyncio.create_task(send_to_rawnet(base64_audio, identity_result, session_id=session_id))
+
+    return identity_result
+
+
+async def consume_audio_track(track, caller_id: str, session_id: str):
+    print("Audio buffer engine started.")
     audio_buffer = []
     sample_rate = 0
-    TARGET_SECONDS = 3.0 
-
+    target_seconds = 3.0
     chunk_counter = 0
+
     while True:
         try:
             frame = await track.recv()
             audio_array = frame.to_ndarray()
-            
-            # --- SAFEGUARD: Prevent float-to-int silence bugs ---
             is_float = np.issubdtype(audio_array.dtype, np.floating)
 
             num_channels = len(frame.layout.channels)
@@ -245,78 +471,71 @@ async def consume_audio_track(track, caller_id: str):
                 else:
                     audio_array = np.mean(audio_array, axis=0, keepdims=True)
 
-            # If the audio came in as a tiny decimal (-1.0 to 1.0), we MUST multiply it 
-            # by 32767 before turning it into a 16-bit integer, or it becomes zero!
             if is_float:
                 audio_array = (audio_array * 32767.0).astype(np.int16)
             else:
                 audio_array = audio_array.astype(np.int16)
-            # --------------------------------------------------------
 
             if sample_rate == 0:
                 sample_rate = frame.sample_rate
-                print(f"⚙️ Audio format locked in at: {sample_rate}Hz (Float: {is_float})")
+                print(f"Audio format locked at {sample_rate}Hz.")
+                live_identity_monitor.mark_track_connected(session_id)
 
             audio_buffer.append(audio_array)
-
-            total_samples = sum(arr.shape[1] for arr in audio_buffer) 
+            total_samples = sum(arr.shape[1] for arr in audio_buffer)
             current_duration = total_samples / sample_rate
 
-            if current_duration >= TARGET_SECONDS:
+            if current_duration >= target_seconds:
                 chunk_counter += 1
                 combined_audio = np.concatenate(audio_buffer, axis=1).T
-                
-                # --- THE X-RAY: Check the absolute loudest sound in the chunk ---
                 max_volume = np.max(np.abs(combined_audio))
-                print(f"📦 BOOM! Chunk {chunk_counter} | Max Volume: {max_volume} | Dispatching...")
-                # ----------------------------------------------------------------
-
-                wav_io = io.BytesIO()
-                sf.write(wav_io, combined_audio, sample_rate, format='WAV', subtype='PCM_16')
-                wav_bytes = wav_io.getvalue()
-
-                identity_result = identity_auditor.verify_chunk(
+                print(
+                    f"Dispatching live chunk {chunk_counter} | peak={float(max_volume):.2f}"
+                )
+                await process_identity_chunk(
                     caller_id=caller_id,
                     audio=combined_audio,
                     sample_rate=sample_rate,
+                    session_id=session_id,
+                    dispatch_signal_auditor=True,
                 )
-
-                filename = f"debug_chunk_{chunk_counter}.wav"
-                with open(filename, "wb") as f:
-                    f.write(wav_bytes)
-
-                base64_audio = base64.b64encode(wav_bytes).decode('utf-8')
-                asyncio.create_task(send_to_rawnet(base64_audio, identity_result))
-                
                 audio_buffer.clear()
-
-        except Exception as e:
-            print(f"🛑 Audio stream ended or disconnected. Reason: {e}")
+        except Exception as exc:
+            print(f"Audio stream ended or disconnected: {exc}")
+            live_identity_monitor.record_error(session_id, str(exc))
             break
-# -------------------------------
+
 
 @app.post("/offer")
 async def process_offer(params: Offer):
-    print("📡 Received WebRTC offer from Trust-Call Shield...")
-    
+    print("Received WebRTC offer from Trust-Call.")
     offer = RTCSessionDescription(sdp=params.sdp, type=params.type)
     pc = RTCPeerConnection()
+    live_session = live_identity_monitor.start_session(
+        caller_id=params.caller_id,
+        source="webrtc",
+    )
 
     @pc.on("track")
     def on_track(track):
-        print("🟢 Live Audio track connected!")
-        # Spin up our buffer engine in the background the moment the track connects
-        asyncio.ensure_future(consume_audio_track(track, params.caller_id))
+        print("Live audio track connected.")
+        asyncio.ensure_future(
+            consume_audio_track(track, params.caller_id, live_session["session_id"])
+        )
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
 
-    print("📤 Sending WebRTC answer back to mobile app...")
-    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    print("Sending WebRTC answer back to mobile app.")
+    return {
+        "sdp": pc.localDescription.sdp,
+        "type": pc.localDescription.type,
+        "session_id": live_session["session_id"],
+    }
 
 
-# --- START THE SERVER ---
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8080)
