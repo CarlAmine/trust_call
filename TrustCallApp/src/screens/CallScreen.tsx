@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, PermissionsAndroid, Platform } from 'react-native';
 import { mediaDevices, RTCPeerConnection, RTCSessionDescription } from 'react-native-webrtc';
+import { getBackendHttpUrl, getBackendWsUrl, getResolvedBackendBaseUrl } from '../config/backend';
 
 
 const CallScreen = ({ navigation, route }: any) => {
@@ -50,6 +51,7 @@ const CallScreen = ({ navigation, route }: any) => {
       }
 
       console.log('1. Permission granted! Initializing WebRTC stream...');
+      console.log(`Using Trust-Call backend at ${getResolvedBackendBaseUrl()}`);
       
       // --- THE FIX 1: Revert to standard audio to prevent the "Dummy Track" bug ---
       const stream = await mediaDevices.getUserMedia({
@@ -80,7 +82,7 @@ const CallScreen = ({ navigation, route }: any) => {
 
       console.log('4. Sending Offer to Python Server...');
       try {
-        const response = await fetch('http://10.0.2.2:8080/offer', {
+        const response = await fetch(getBackendHttpUrl('/offer'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -104,7 +106,7 @@ const CallScreen = ({ navigation, route }: any) => {
 
         // --- THE FIX 2: Open the WebSocket strictly AFTER audio is flowing ---
         console.log('6. Opening Telemetry WebSocket...');
-        ws.current = new WebSocket('ws://10.0.2.2:8080/ws'); 
+        ws.current = new WebSocket(getBackendWsUrl('/ws')); 
         
         ws.current.onopen = () => console.log('🔗 WebSocket Connected to Telemetry Stream');
         
