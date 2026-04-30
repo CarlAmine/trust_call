@@ -244,3 +244,46 @@ Moving beyond keyword matching, we're fine-tuning `DistilBERT` on a domain-speci
 - Microservice Brain Transplant: Successfully migrated the ~260MB local model weights (.safetensors) directly into the distilbert-service directory, updating .gitignore protocols to safely bypass GitHub's 100MB file limits.
 
 - API Activation: Updated the main.py entry point to load the local custom model and flipped the USE_CLASSIFIER flag to True, officially switching the WebRTC pipeline's semantic analysis to the live neural network.
+
+
+
+
+
+#  MLOps & Telemetry Infrastructure Update (Phase Completion) (Date: 30/4/2026, author: George Habib)
+1. Audio Deepfake Model Evaluation (RawNet2)
+
+Finalized the evaluate_rawnet.py script to automatically run comparative testing between the ASVspoof Baseline and the Fine-Tuned Custom model.
+
+Bug Fixes:
+
+Resolved a PyTorch tensor dimension bug by correcting the unsqueeze() logic for single-file audio inference.
+
+Fixed an architecture mutation bug where the d_args dictionary was being passed by reference and altered, allowing multiple models to load sequentially in the same script without state dictionary mismatches.
+
+Stability: Implemented soundfile for audio loading to permanently bypass Windows FFmpeg crash issues during inference.
+
+2. MLflow Centralization & Version Control
+
+Centralized Database: Migrated away from fragmented, microservice-level MLflow tracking. Established a single, unified SQLite master database (mlflow.db) at the project root (E:\trust_call).
+
+Updated all training and evaluation scripts (train.py, train_transfer.py, evaluate_models.py, evaluate_rawnet.py) to route their metrics to the absolute URI of the central hub.
+
+Git Safety Lock: Added strict .gitignore rules to prevent massive AI weights (*.pth, *.pt) and binary database files (mlflow.db, mlruns/) from bloating the GitHub repository and causing merge conflicts.
+
+3. Enterprise Monitoring Stack (Prometheus & Grafana)
+
+Infrastructure as Code: Built a docker-compose.yml engine at the project root to spin up Prometheus and Grafana simultaneously.
+
+FastAPI Instrumentation: Injected prometheus-fastapi-instrumentator into both the rawnet-service and distilbert-service to automatically generate real-time /metrics endpoints.
+
+WSL/Windows Network Bridging: Successfully configured prometheus.yml to bridge the gap between Docker containers running in Ubuntu (WSL) and the native FastAPI Python servers running on Windows using explicit IPv4 routing.
+
+Grafana Dashboard Integration:
+
+Connected Grafana to the Prometheus data source.
+
+Wrote custom PromQL queries (sum(rate(http_requests_total{handler!="/metrics"}[1m])) by (job)) to track live HTTP traffic hitting the AI models while automatically filtering out background telemetry noise.
+
+Fixed port routing (8002) in the test_client.py script to accurately simulate traffic.
+
+Exported the resulting real-time "AI Model Traffic" dashboard as a .json file and saved it to the monitoring/ folder for team-wide version control and easy importing.
