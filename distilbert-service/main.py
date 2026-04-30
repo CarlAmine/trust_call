@@ -11,6 +11,9 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
+
+from prometheus_fastapi_instrumentator import Instrumentator
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # =====================================================================
@@ -195,7 +198,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(title="DistilBERT Semantic Auditor", version="1.0", lifespan=lifespan)
-
+Instrumentator().instrument(app).expose(app)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_: Request, exc: RequestValidationError):

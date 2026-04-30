@@ -10,6 +10,8 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 from model import RawNet
 
+from prometheus_fastapi_instrumentator import Instrumentator
+
 # 1. Define RawNet2 Architecture Configuration
 d_args = {
     "nb_samp": 64000,
@@ -44,6 +46,10 @@ async def lifespan(app: FastAPI):
     app.state.model = None
 
 app = FastAPI(lifespan=lifespan)
+Instrumentator().instrument(app).expose(app)
+
+
+
 
 class AudioPayload(BaseModel):
     base64_audio: str
