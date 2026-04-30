@@ -1,5 +1,7 @@
 import pandas as pd
 import torch
+import os        # NEW
+import mlflow    # NEW
 from datasets import Dataset
 from transformers import (
     DistilBertTokenizerFast,
@@ -9,6 +11,13 @@ from transformers import (
 )
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+
+# ==========================================
+# NEW: MLFLOW ENVIRONMENT SETUP
+# ==========================================
+# We use environment variables so Hugging Face automatically detects your local server
+os.environ["MLFLOW_TRACKING_URI"] = "http://127.0.0.1:5000"
+os.environ["MLFLOW_EXPERIMENT_NAME"] = "Semantic_Auditor_Training"
 
 # ==========================================
 # 1. DATA PREPARATION & SPLITTING
@@ -28,7 +37,6 @@ train_texts, val_texts, train_labels, val_labels = train_test_split(
 # 2. TOKENIZATION (TEXT -> NUMBERS)
 # ==========================================
 print("⚙️ Tokenizing text data...")
-# Load the official dictionary that DistilBERT uses to convert words to numbers
 tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
 
 train_encodings = tokenizer(train_texts, truncation=True, padding=True, max_length=128)
@@ -69,21 +77,21 @@ def compute_metrics(pred):
 # 4. MODEL ARCHITECTURE & TRAINING LOOP
 # ==========================================
 print("🧠 Loading Base Model into RAM...")
-# We tell the base model we want exactly 2 output labels (0: Safe, 1: Scam)
 model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)
 
 training_args = TrainingArguments(
     output_dir='./results',
-    num_train_epochs=3,              # Read the whole dataset 3 times
-    per_device_train_batch_size=16,  # Look at 16 examples at a time
+    num_train_epochs=3,              
+    per_device_train_batch_size=16,  
     per_device_eval_batch_size=64,
     warmup_steps=50,
     weight_decay=0.01,
     logging_dir='./logs',
     logging_steps=10,
-    eval_strategy="epoch",       # Grade the AI at the end of each epoch
+    eval_strategy="epoch",       
     save_strategy="epoch",
-    load_best_model_at_end=True      # Keep the smartest version
+    load_best_model_at_end=True,     
+    report_to="mlflow"               # NEW: Tells Hugging Face to beam stats directly to MLflow!
 )
 
 trainer = Trainer(
