@@ -13,8 +13,18 @@ from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-DEFAULT_MODEL_NAME = os.getenv("DISTILBERT_MODEL_NAME", "distilbert-base-uncased")
-USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "false").lower() in {"1", "true", "yes"}
+# =====================================================================
+# --- OLD CODE (Regex Heuristic Baseline) ---
+# Keeping this commented out for easy rollback if needed
+# DEFAULT_MODEL_NAME = os.getenv("DISTILBERT_MODEL_NAME", "distilbert-base-uncased")
+# USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "false").lower() in {"1", "true", "yes"}
+# =====================================================================
+
+# --- NEW CODE (Fine-Tuned Neural Network) ---
+DEFAULT_MODEL_NAME = os.getenv("DISTILBERT_MODEL_NAME", "./custom_scam_model")
+USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "true").lower() in {"1", "true", "yes"}
+
+
 USE_EMBEDDINGS = os.getenv("DISTILBERT_USE_EMBEDDINGS", "true").lower() in {"1", "true", "yes"}
 USE_CUDA = os.getenv("DISTILBERT_USE_CUDA", "false").lower() in {"1", "true", "yes"}
 

@@ -243,9 +243,7 @@ venv/
 __pycache__/
 
 
+
 custom_scam_model/
 results/
 checkpoint-*/
-
-# Local edge identity enrollment state
-trust_call_backend/state/
