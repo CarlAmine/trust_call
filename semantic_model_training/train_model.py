@@ -16,7 +16,7 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 # NEW: MLFLOW ENVIRONMENT SETUP
 # ==========================================
 # We use environment variables so Hugging Face automatically detects your local server
-os.environ["MLFLOW_TRACKING_URI"] = "http://127.0.0.1:5000"
+os.environ["MLFLOW_TRACKING_URI"] = "sqlite:///E:/trust_call/mlflow.db"
 os.environ["MLFLOW_EXPERIMENT_NAME"] = "Semantic_Auditor_Training"
 
 # ==========================================

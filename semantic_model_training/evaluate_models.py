@@ -9,7 +9,7 @@ from transformers import DistilBertForSequenceClassification, DistilBertTokenize
 # ==========================================
 # 1. SETUP MLFLOW TRACKING
 # ==========================================
-mlflow.set_tracking_uri("http://127.0.0.1:5000")
+mlflow.set_tracking_uri("sqlite:///E:/trust_call/mlflow.db")
 mlflow.set_experiment("Semantic_Auditor_Evaluation_V2.1")
 
 # ==========================================
