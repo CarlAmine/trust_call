@@ -19,16 +19,97 @@ const CallScreen = ({ navigation, route }: any) => {
   const [semanticStatus, setSemanticStatus] = useState<string>('Pending...');
   const [identityStatus, setIdentityStatus] = useState<string>('Pending...');
   const [identityConfidence, setIdentityConfidence] = useState<string>('Pending...');
+  const [identityMode, setIdentityMode] = useState<string>('Pending...');
+  const [identifiedCaller, setIdentifiedCaller] = useState<string>('Pending...');
   const [identityChunks, setIdentityChunks] = useState<number>(0);
   const [identityReason, setIdentityReason] = useState<string>('Awaiting live audio...');
+  const [audioFrames, setAudioFrames] = useState<number>(0);
+  const [bufferedSeconds, setBufferedSeconds] = useState<string>('0.00s');
   const [fusionStatus, setFusionStatus] = useState<string>('WAITING');
   const [sessionId, setSessionId] = useState<string>('Not Connected');
+  const [telemetryStatus, setTelemetryStatus] = useState<string>('Disconnected');
 
   const [signalColor, setSignalColor] = useState<string>('#4CAF50'); // Default Green
 
   const [isCallActive, setIsCallActive] = useState(false);
   
   const ws = useRef<WebSocket | null>(null);
+
+  const formatPercent = (value: unknown): string => {
+    if (value == null || value === '') {
+      return 'Pending...';
+    }
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? `${(numeric * 100).toFixed(1)}%` : String(value);
+  };
+
+  const formatSessionId = (value: string): string => {
+    if (!value || value === 'Not Connected' || value === 'Unknown Session') {
+      return value;
+    }
+    return value.slice(0, 8);
+  };
+
+  const applyIdentityTelemetry = (payload: any, chunkCount?: number) => {
+    const identityText =
+      payload.identity_match ??
+      payload.display_text ??
+      payload.status ??
+      'Pending...';
+    const confidence =
+      payload.identity_match_confidence ??
+      payload.match_confidence ??
+      null;
+    const mode =
+      payload.identity_mode ??
+      payload.identification_mode ??
+      'verification';
+    const identified =
+      payload.identity_identified_caller_id ??
+      payload.identified_caller_id ??
+      'No candidate';
+    const reason =
+      payload.identity_reason ??
+      payload.reason ??
+      'No runtime issue reported';
+
+    setIdentityStatus(String(identityText));
+    setIdentityConfidence(formatPercent(confidence));
+    setIdentityMode(String(mode));
+    setIdentifiedCaller(String(identified));
+    setIdentityReason(String(reason));
+    if (typeof chunkCount === 'number') {
+      setIdentityChunks(chunkCount);
+    }
+  };
+
+  const applySessionSnapshot = (session: any) => {
+    setTelemetryStatus((current) => (current === 'Connected' ? 'Connected + Polling' : 'Polling'));
+    setAudioFrames(typeof session.frames_received === 'number' ? session.frames_received : 0);
+    setBufferedSeconds(
+      typeof session.buffered_duration_seconds === 'number'
+        ? `${session.buffered_duration_seconds.toFixed(2)}s`
+        : '0.00s'
+    );
+    setIdentityChunks(typeof session.chunks_processed === 'number' ? session.chunks_processed : 0);
+
+    if (session.last_signal_score) {
+      setSignalScore(session.last_signal_score);
+      setSignalColor(session.last_signal_threat ? '#FF3B30' : '#4CAF50');
+    }
+
+    if (session.last_identity_result) {
+      applyIdentityTelemetry(session.last_identity_result, session.chunks_processed);
+      setFusionStatus(
+        session.state === 'telemetry_broadcast'
+          ? 'ANALYZING'
+          : String(session.state ?? 'ANALYZING').toUpperCase()
+      );
+      return;
+    }
+
+    setIdentityReason(session.last_error ?? session.state ?? 'Awaiting live audio...');
+  };
 
   const startAudioStream = async () => {
     try {
@@ -108,34 +189,36 @@ const CallScreen = ({ navigation, route }: any) => {
         console.log('6. Opening Telemetry WebSocket...');
         ws.current = new WebSocket(getBackendWsUrl('/ws')); 
         
-        ws.current.onopen = () => console.log('🔗 WebSocket Connected to Telemetry Stream');
+        ws.current.onopen = () => {
+          console.log('🔗 WebSocket Connected to Telemetry Stream');
+          setTelemetryStatus('Connected');
+        };
         
         ws.current.onmessage = (e) => {
           try {
             console.log("🔥 WEBSOCKET MESSAGE RECEIVED: ", e.data);
             const data = JSON.parse(e.data);
+            setTelemetryStatus('Connected');
             setSignalScore(data.signal_score);
             // If it's a threat, turn the text Red. Otherwise, keep it Green.
             setSignalColor(data.is_threat ? '#FF3B30' : '#4CAF50'); 
 
             setSemanticStatus(data.semantic_intent);
-            setIdentityStatus(data.identity_match);
-            setIdentityConfidence(
-              data.identity_match_confidence != null
-                ? `${(Number(data.identity_match_confidence) * 100).toFixed(1)}%`
-                : 'Pending...'
-            );
-            setIdentityChunks(
-              typeof data.identity_chunk_count === 'number' ? data.identity_chunk_count : 0
-            );
-            setIdentityReason(data.identity_reason ?? 'No runtime issue reported');
+            applyIdentityTelemetry(data, data.identity_chunk_count);
             setFusionStatus(data.fusion_status);
           } catch (error) {
             console.error("Error parsing telemetry data", error);
           }
         };
         
-        ws.current.onerror = (e: any) => console.log('❌ WebSocket Error: ', e.message);
+        ws.current.onerror = (e: any) => {
+          console.log('❌ WebSocket Error: ', e.message);
+          setTelemetryStatus('Error');
+        };
+        ws.current.onclose = () => {
+          console.log('Telemetry WebSocket closed');
+          setTelemetryStatus('Closed');
+        };
         // ---------------------------------------------------------------------
 
       } catch (networkError) {
@@ -161,6 +244,37 @@ const handleAcceptCall = () => {
     }
     return () => clearInterval(timer);
   }, [isCallActive]);
+
+  useEffect(() => {
+    if (!isCallActive || sessionId === 'Not Connected' || sessionId === 'Unknown Session') {
+      return;
+    }
+
+    let cancelled = false;
+
+    const pollSession = async () => {
+      try {
+        const response = await fetch(getBackendHttpUrl(`/identity/live/sessions/${sessionId}`));
+        if (!response.ok) {
+          return;
+        }
+        const session = await response.json();
+        if (!cancelled) {
+          applySessionSnapshot(session);
+        }
+      } catch (error) {
+        console.log('Live session polling failed:', error);
+      }
+    };
+
+    pollSession();
+    const pollTimer = setInterval(pollSession, 1500);
+
+    return () => {
+      cancelled = true;
+      clearInterval(pollTimer);
+    };
+  }, [isCallActive, sessionId]);
 
   
   const formatTime = (seconds: number) => {
@@ -189,39 +303,60 @@ const handleAcceptCall = () => {
       <View style={styles.header}>
         <Text style={styles.callerName}>{callerName}</Text>
         <Text style={styles.callTime}>{formatTime(callDuration)}</Text>
-        <Text style={styles.sessionMeta}>Session: {sessionId}</Text>
+        <Text style={styles.sessionMeta}>Session: {formatSessionId(sessionId)}</Text>
+        <Text style={styles.sessionMeta}>Telemetry: {telemetryStatus}</Text>
       </View>
 
       <View style={styles.telemetryBoard}>
         <Text style={styles.boardTitle}>Live AI Telemetry</Text>
         
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Signal (RawNet2):</Text>
+          <Text style={styles.metricLabel}>Signal</Text>
           <Text style={[styles.metricValueSafe, { color: signalColor }]}>{signalScore}</Text>
         </View>
         
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Semantic (Intent):</Text>
+          <Text style={styles.metricLabel}>Semantic</Text>
           <Text style={styles.metricValueSafe}>{semanticStatus}</Text>
         </View>
 
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Identity (ECAPA):</Text>
+          <Text style={styles.metricLabel}>Identity</Text>
           <Text style={styles.metricValueWarning}>{identityStatus}</Text>
         </View>
 
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Identity Confidence:</Text>
+          <Text style={styles.metricLabel}>Confidence</Text>
           <Text style={styles.metricValueSafe}>{identityConfidence}</Text>
         </View>
 
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Identity Chunks:</Text>
+          <Text style={styles.metricLabel}>Mode</Text>
+          <Text style={styles.metricValueSafe}>{identityMode}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Candidate</Text>
+          <Text style={styles.metricValueSafe}>{identifiedCaller}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Chunks</Text>
           <Text style={styles.metricValueSafe}>{identityChunks}</Text>
         </View>
 
         <View style={styles.metricRow}>
-          <Text style={styles.metricLabel}>Identity Reason:</Text>
+          <Text style={styles.metricLabel}>Frames</Text>
+          <Text style={styles.metricValueSafe}>{audioFrames}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Buffered</Text>
+          <Text style={styles.metricValueSafe}>{bufferedSeconds}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>Reason</Text>
           <Text style={styles.metricValueSubtle}>{identityReason}</Text>
         </View>
       </View>
@@ -261,11 +396,11 @@ const styles = StyleSheet.create({
   
   telemetryBoard: { backgroundColor: '#1A1A1A', padding: 20, borderRadius: 15, borderWidth: 1, borderColor: '#333' },
   boardTitle: { color: '#555', fontSize: 12, textTransform: 'uppercase', marginBottom: 15, letterSpacing: 1 },
-  metricRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15 },
-  metricLabel: { color: '#CCC', fontSize: 16 },
-  metricValueSafe: { color: '#4CAF50', fontSize: 16, fontWeight: 'bold' },
-  metricValueWarning: { color: '#FFC107', fontSize: 16, fontWeight: 'bold' },
-  metricValueSubtle: { color: '#AAA', fontSize: 14, fontWeight: '500', flexShrink: 1, textAlign: 'right', maxWidth: '55%' },
+  metricRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 15, gap: 12 },
+  metricLabel: { color: '#CCC', fontSize: 16, width: 92 },
+  metricValueSafe: { color: '#4CAF50', fontSize: 16, fontWeight: 'bold', flex: 1, textAlign: 'right' },
+  metricValueWarning: { color: '#FFC107', fontSize: 16, fontWeight: 'bold', flex: 1, textAlign: 'right' },
+  metricValueSubtle: { color: '#AAA', fontSize: 14, fontWeight: '500', flex: 1, textAlign: 'right' },
   
   decisionEngine: { alignItems: 'center', marginTop: 40 },
   decisionLabel: { color: '#888', fontSize: 14, textTransform: 'uppercase' },
