@@ -10,7 +10,7 @@ SAMPLES = [
 
 
 async def run_tests() -> None:
-    url = "http://127.0.0.1:8000/predict"
+    url = "http://127.0.0.1:8002/predict"
     async with httpx.AsyncClient() as client:
         for label, text in SAMPLES:
             try:
