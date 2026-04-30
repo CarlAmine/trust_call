@@ -68,11 +68,19 @@ class IdentityVerificationPayload(BaseModel):
     base64_audio: str
 
 
+class IdentityIdentificationPayload(BaseModel):
+    base64_audio: str
+    claimed_caller_id: str = "unknown"
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
 class LiveIdentityValidationPayload(BaseModel):
     caller_id: str
     base64_audio: str
     session_id: str | None = None
     dispatch_signal_auditor: bool = False
+    identify_if_unenrolled: bool = True
+    top_k: int = Field(default=3, ge=1, le=10)
 
 
 class ConnectionManager:
@@ -117,7 +125,12 @@ class LiveIdentityMonitor:
             "created_at_utc": now,
             "last_updated_at_utc": now,
             "track_connected_at_utc": None,
+            "track_kind": None,
             "sample_rate_hz": None,
+            "frames_received": 0,
+            "last_frame_at_utc": None,
+            "last_frame_shape": None,
+            "buffered_duration_seconds": 0.0,
             "chunks_processed": 0,
             "last_chunk_peak": None,
             "last_chunk_duration_seconds": None,
@@ -134,13 +147,33 @@ class LiveIdentityMonitor:
             self._sessions.pop(evicted, None)
         return session
 
-    def mark_track_connected(self, session_id: str) -> None:
+    def mark_track_connected(self, session_id: str, track_kind: str | None = None) -> None:
         session = self._sessions.get(session_id)
         if session is None:
             return
         session["track_connected_at_utc"] = _utc_now()
+        session["track_kind"] = track_kind
         session["state"] = "track_connected"
         session["last_updated_at_utc"] = session["track_connected_at_utc"]
+
+    def record_frame(
+        self,
+        session_id: str,
+        sample_rate: int,
+        frame_shape: tuple[int, ...],
+        buffered_duration_seconds: float,
+    ) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        now = _utc_now()
+        session["frames_received"] = int(session["frames_received"]) + 1
+        session["sample_rate_hz"] = sample_rate
+        session["last_frame_at_utc"] = now
+        session["last_frame_shape"] = list(frame_shape)
+        session["buffered_duration_seconds"] = round(float(buffered_duration_seconds), 3)
+        session["state"] = "receiving_audio"
+        session["last_updated_at_utc"] = now
 
     def record_chunk(
         self,
@@ -218,7 +251,12 @@ class LiveIdentityMonitor:
             "created_at_utc": session["created_at_utc"],
             "last_updated_at_utc": session["last_updated_at_utc"],
             "track_connected_at_utc": session["track_connected_at_utc"],
+            "track_kind": session["track_kind"],
             "sample_rate_hz": session["sample_rate_hz"],
+            "frames_received": session["frames_received"],
+            "last_frame_at_utc": session["last_frame_at_utc"],
+            "last_frame_shape": session["last_frame_shape"],
+            "buffered_duration_seconds": session["buffered_duration_seconds"],
             "chunks_processed": session["chunks_processed"],
             "last_chunk_peak": session["last_chunk_peak"],
             "last_chunk_duration_seconds": session["last_chunk_duration_seconds"],
@@ -232,6 +270,7 @@ def _utc_now() -> str:
 
 manager = ConnectionManager()
 live_identity_monitor = LiveIdentityMonitor()
+peer_connections: set[RTCPeerConnection] = set()
 state_root = Path(__file__).resolve().parent / "state"
 identity_config = load_identity_auditor_config()
 identity_store = IdentityEnrollmentStore(state_root / "identity_profiles")
@@ -322,6 +361,21 @@ async def verify_identity(payload: IdentityVerificationPayload):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
+@app.post("/identity/identify")
+async def identify_identity(payload: IdentityIdentificationPayload):
+    try:
+        result = identity_auditor.identify_from_base64(
+            base64_audio=payload.base64_audio,
+            claimed_caller_id=payload.claimed_caller_id,
+            top_k=payload.top_k,
+        )
+        return result.to_api_response()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
 @app.post("/identity/live/validate")
 async def validate_live_identity_chunk(payload: LiveIdentityValidationPayload):
     try:
@@ -343,6 +397,8 @@ async def validate_live_identity_chunk(payload: LiveIdentityValidationPayload):
             sample_rate=sample_rate,
             session_id=session["session_id"],
             dispatch_signal_auditor=payload.dispatch_signal_auditor,
+            identify_if_unenrolled=payload.identify_if_unenrolled,
+            top_k=payload.top_k,
         )
         return {
             "session_id": session["session_id"],
@@ -367,9 +423,9 @@ async def delete_identity_enrollment(caller_id: str):
 
 
 def build_fusion_status(identity_result: IdentityResult) -> str:
-    if identity_result.status == "mismatch":
+    if identity_result.status in {"mismatch", "unknown_speaker"}:
         return "IDENTITY REVIEW"
-    if identity_result.status == "review":
+    if identity_result.status in {"review", "identity_candidate"}:
         return "IDENTITY CAUTION"
     return "ANALYZING"
 
@@ -420,18 +476,49 @@ async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult, ses
         )
 
 
+async def broadcast_identity_telemetry(identity_result: IdentityResult, session_id: str) -> None:
+    session = live_identity_monitor.get_session(session_id)
+    await manager.broadcast(
+        {
+            "session_id": session_id,
+            "caller_id": identity_result.caller_id,
+            "signal_score": "Analyzing...",
+            "is_threat": False,
+            "semantic_intent": "Low Risk",
+            "fusion_status": build_fusion_status(identity_result),
+            "identity_chunk_count": (
+                session["chunks_processed"] if session is not None else None
+            ),
+            **identity_result.to_telemetry(),
+        }
+    )
+
+
 async def process_identity_chunk(
     caller_id: str,
     audio: np.ndarray,
     sample_rate: int,
     session_id: str,
     dispatch_signal_auditor: bool = True,
+    identify_if_unenrolled: bool = True,
+    top_k: int = 3,
 ) -> IdentityResult:
     identity_result = identity_auditor.verify_chunk(
         caller_id=caller_id,
         audio=audio,
         sample_rate=sample_rate,
     )
+    if identify_if_unenrolled and identity_result.status in {
+        "missing_caller_id",
+        "not_enrolled",
+        "profile_incompatible",
+    }:
+        identity_result = identity_auditor.identify_chunk(
+            audio=audio,
+            sample_rate=sample_rate,
+            claimed_caller_id=caller_id,
+            top_k=top_k,
+        )
     chunk_peak = float(np.max(np.abs(np.asarray(audio)))) if np.asarray(audio).size else 0.0
     live_identity_monitor.record_chunk(
         session_id=session_id,
@@ -439,6 +526,7 @@ async def process_identity_chunk(
         sample_rate=sample_rate,
         chunk_peak=chunk_peak,
     )
+    await broadcast_identity_telemetry(identity_result, session_id)
 
     if dispatch_signal_auditor:
         wav_io = io.BytesIO()
@@ -460,30 +548,26 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
     while True:
         try:
             frame = await track.recv()
-            audio_array = frame.to_ndarray()
-            is_float = np.issubdtype(audio_array.dtype, np.floating)
-
-            num_channels = len(frame.layout.channels)
-            if num_channels > 1:
-                if audio_array.shape[0] == 1:
-                    audio_array = audio_array.reshape(-1, num_channels)
-                    audio_array = np.mean(audio_array, axis=1).reshape(1, -1)
-                else:
-                    audio_array = np.mean(audio_array, axis=0, keepdims=True)
-
-            if is_float:
-                audio_array = (audio_array * 32767.0).astype(np.int16)
-            else:
-                audio_array = audio_array.astype(np.int16)
+            raw_audio = frame.to_ndarray()
+            audio_array = _audio_frame_to_mono_int16(raw_audio, len(frame.layout.channels))
 
             if sample_rate == 0:
                 sample_rate = frame.sample_rate
                 print(f"Audio format locked at {sample_rate}Hz.")
-                live_identity_monitor.mark_track_connected(session_id)
+                live_identity_monitor.mark_track_connected(
+                    session_id,
+                    track_kind=getattr(track, "kind", None),
+                )
 
             audio_buffer.append(audio_array)
             total_samples = sum(arr.shape[1] for arr in audio_buffer)
             current_duration = total_samples / sample_rate
+            live_identity_monitor.record_frame(
+                session_id=session_id,
+                sample_rate=sample_rate,
+                frame_shape=tuple(raw_audio.shape),
+                buffered_duration_seconds=current_duration,
+            )
 
             if current_duration >= target_seconds:
                 chunk_counter += 1
@@ -506,15 +590,46 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
             break
 
 
+def _audio_frame_to_mono_int16(audio_array: np.ndarray, num_channels: int) -> np.ndarray:
+    audio_array = np.asarray(audio_array)
+    is_float = np.issubdtype(audio_array.dtype, np.floating)
+
+    if audio_array.ndim == 1:
+        mono = audio_array.reshape(1, -1)
+    elif num_channels > 1:
+        if audio_array.shape[0] == 1:
+            reshaped = audio_array.reshape(-1, num_channels)
+            mono = np.mean(reshaped, axis=1, keepdims=True).T
+        else:
+            mono = np.mean(audio_array, axis=0, keepdims=True)
+    else:
+        mono = audio_array.reshape(1, -1)
+
+    if is_float:
+        return np.clip(mono * 32767.0, -32768, 32767).astype(np.int16)
+    return mono.astype(np.int16)
+
+
 @app.post("/offer")
 async def process_offer(params: Offer):
     print("Received WebRTC offer from Trust-Call.")
     offer = RTCSessionDescription(sdp=params.sdp, type=params.type)
     pc = RTCPeerConnection()
+    peer_connections.add(pc)
     live_session = live_identity_monitor.start_session(
         caller_id=params.caller_id,
         source="webrtc",
     )
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        print(f"Peer connection state: {pc.connectionState}")
+        if pc.connectionState in {"failed", "closed", "disconnected"}:
+            peer_connections.discard(pc)
+            live_identity_monitor.record_error(
+                live_session["session_id"],
+                f"peer_connection_{pc.connectionState}",
+            )
 
     @pc.on("track")
     def on_track(track):

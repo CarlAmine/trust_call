@@ -47,6 +47,7 @@ DEFAULT_EMA_ALPHA = DEFAULT_IDENTITY_CONFIG.ema_alpha
 IDENTITY_STATUS_CONTRACT = {
     "missing_caller_id": "No claimed identity was provided for the call.",
     "not_enrolled": "No local identity profile exists for the claimed caller.",
+    "no_enrolled_profiles": "No local identity profiles exist for 1:N identification.",
     "insufficient_audio": "The speech segment is too short for reliable verification.",
     "low_energy": "The speech segment is too quiet for reliable verification.",
     "profile_incompatible": "The stored profile was created with a different embedder.",
@@ -54,6 +55,9 @@ IDENTITY_STATUS_CONTRACT = {
     "match": "The current speaker matches the enrolled profile.",
     "review": "The current speaker is borderline and should be corroborated.",
     "mismatch": "The current speaker does not match the enrolled profile.",
+    "identified": "The current speaker strongly matches a known local profile.",
+    "identity_candidate": "The current speaker weakly matches a known local profile.",
+    "unknown_speaker": "The current speaker does not match any local profile.",
 }
 
 IDENTITY_POLICY_CONTRACT = {
@@ -103,10 +107,18 @@ class IdentityResult:
     reason: str | None
     enrolled: bool
     duration_seconds: float
+    identification_mode: str = "verification"
+    identified_caller_id: str | None = None
+    candidate_count: int = 0
+    candidates: list[dict[str, Any]] | None = None
 
     def to_telemetry(self) -> dict[str, Any]:
         return {
             "caller_id": self.caller_id,
+            "identity_mode": self.identification_mode,
+            "identity_identified_caller_id": self.identified_caller_id,
+            "identity_candidate_count": self.candidate_count,
+            "identity_candidates": self.candidates or [],
             "identity_score": round(self.identity_score, 4),
             "identity_similarity": (
                 round(self.similarity, 6) if self.similarity is not None else None
@@ -126,6 +138,10 @@ class IdentityResult:
     def to_api_response(self) -> dict[str, Any]:
         return {
             "caller_id": self.caller_id,
+            "identification_mode": self.identification_mode,
+            "identified_caller_id": self.identified_caller_id,
+            "candidate_count": self.candidate_count,
+            "candidates": self.candidates or [],
             "status": self.status,
             "identity_score": round(self.identity_score, 4),
             "similarity": round(self.similarity, 6) if self.similarity is not None else None,
@@ -164,6 +180,13 @@ class IdentityEnrollmentStore:
 
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
+
+    def load_all(self) -> list[dict[str, Any]]:
+        profiles: list[dict[str, Any]] = []
+        for path in sorted(self.root_dir.glob("*.json")):
+            with path.open("r", encoding="utf-8") as handle:
+                profiles.append(json.load(handle))
+        return profiles
 
     def save(self, caller_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         path = self.path_for(caller_id)
@@ -537,6 +560,137 @@ class IdentityAuditor:
     def verify_from_base64(self, caller_id: str, base64_audio: str) -> IdentityResult:
         audio, sample_rate = decode_base64_audio(base64_audio)
         return self.verify_chunk(caller_id=caller_id, audio=audio, sample_rate=sample_rate)
+
+    def identify_chunk(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        claimed_caller_id: str = "unknown",
+        top_k: int = 3,
+    ) -> IdentityResult:
+        duration_seconds = _duration_seconds(audio, sample_rate)
+        profiles = [
+            profile
+            for profile in self.store.load_all()
+            if profile.get("embedder") == self.embedder.name
+            and isinstance(profile.get("embedding"), list)
+            and profile.get("caller_id")
+        ]
+
+        if not profiles:
+            return IdentityResult(
+                caller_id=claimed_caller_id or "unknown",
+                status="no_enrolled_profiles",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text="No Known Voices",
+                reason="no_local_identity_profiles",
+                enrolled=False,
+                duration_seconds=duration_seconds,
+                identification_mode="identification",
+            )
+
+        try:
+            embedding, _ = self.embedder.extract(audio, sample_rate)
+        except ValueError as exc:
+            reason = str(exc)
+            display_text = (
+                "Need More Speech" if reason == "insufficient_audio" else "Speech Too Quiet"
+            )
+            return IdentityResult(
+                caller_id=claimed_caller_id or "unknown",
+                status=reason,
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text=display_text,
+                reason=reason,
+                enrolled=True,
+                duration_seconds=duration_seconds,
+                identification_mode="identification",
+                candidate_count=len(profiles),
+            )
+        except RuntimeError as exc:
+            reason = str(exc)
+            return IdentityResult(
+                caller_id=claimed_caller_id or "unknown",
+                status="model_unavailable",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text="Model Unavailable",
+                reason=reason,
+                enrolled=True,
+                duration_seconds=duration_seconds,
+                identification_mode="identification",
+                candidate_count=len(profiles),
+            )
+
+        candidates = []
+        for profile in profiles:
+            master_vector = _l2_normalize(np.array(profile["embedding"], dtype=np.float32))
+            similarity = float(np.dot(master_vector, embedding))
+            match_confidence = float(np.clip((similarity + 1.0) / 2.0, 0.0, 1.0))
+            candidates.append(
+                {
+                    "caller_id": profile["caller_id"],
+                    "similarity": round(similarity, 6),
+                    "match_confidence": round(match_confidence, 6),
+                    "identity_score": round(1.0 - match_confidence, 4),
+                }
+            )
+
+        candidates.sort(key=lambda candidate: candidate["match_confidence"], reverse=True)
+        top_candidates = candidates[: max(top_k, 1)]
+        best = top_candidates[0]
+        best_confidence = float(best["match_confidence"])
+        best_similarity = float(best["similarity"])
+        identified_caller_id = str(best["caller_id"])
+
+        if best_confidence >= self.match_threshold:
+            status = "identified"
+            display_text = f"Identified: {identified_caller_id} ({best_confidence:.2f})"
+            reason = None
+        elif best_confidence >= self.review_threshold:
+            status = "identity_candidate"
+            display_text = f"Candidate: {identified_caller_id} ({best_confidence:.2f})"
+            reason = "candidate_below_match_threshold"
+        else:
+            status = "unknown_speaker"
+            display_text = "Unknown Speaker"
+            reason = "no_candidate_above_review_threshold"
+            identified_caller_id = None
+
+        return IdentityResult(
+            caller_id=claimed_caller_id or "unknown",
+            status=status,
+            identity_score=float(1.0 - best_confidence),
+            similarity=best_similarity,
+            match_confidence=best_confidence,
+            display_text=display_text,
+            reason=reason,
+            enrolled=True,
+            duration_seconds=duration_seconds,
+            identification_mode="identification",
+            identified_caller_id=identified_caller_id,
+            candidate_count=len(candidates),
+            candidates=top_candidates,
+        )
+
+    def identify_from_base64(
+        self,
+        base64_audio: str,
+        claimed_caller_id: str = "unknown",
+        top_k: int = 3,
+    ) -> IdentityResult:
+        audio, sample_rate = decode_base64_audio(base64_audio)
+        return self.identify_chunk(
+            audio=audio,
+            sample_rate=sample_rate,
+            claimed_caller_id=claimed_caller_id,
+            top_k=top_k,
+        )
 
     def get_policy_snapshot(self) -> dict[str, Any]:
         return {
