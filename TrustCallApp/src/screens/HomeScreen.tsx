@@ -1,6 +1,11 @@
 import React from 'react';
 import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, Button, PermissionsAndroid, Platform, Alert } from 'react-native';
 
+const DEMO_INCOMING_CALL = {
+  callerId: 'alice_demo',
+  callerName: 'Alice Demo',
+};
+
 const requestCallPermissions = async () => {
   if (Platform.OS !== 'android') return true;
 
@@ -42,8 +47,7 @@ const HomeScreen = ({ navigation }: any) => {
             const hasPermission = await requestCallPermissions();
             if (!hasPermission) return;
 
-            // FIX: Navigate to the CallScreen instead of calling the placeholder
-            navigation.navigate('CallScreen'); 
+            navigation.navigate('CallScreen', DEMO_INCOMING_CALL); 
           }} 
         />
       </View>

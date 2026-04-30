@@ -1,8 +1,14 @@
 import asyncio
+import base64
+import io
+from pathlib import Path
+
+import httpx
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import io
 import base64
@@ -26,6 +32,19 @@ app.add_middleware(
 class Offer(BaseModel):
     sdp: str
     type: str
+    caller_id: str = "unknown"
+
+
+class IdentityEnrollmentPayload(BaseModel):
+    caller_id: str
+    base64_audio: str
+    allow_update: bool = False
+    ema_alpha: float = DEFAULT_EMA_ALPHA
+
+
+class IdentityVerificationPayload(BaseModel):
+    caller_id: str
+    base64_audio: str
 
 # --- WARM START: LOAD WHISPER ---
 print("⏳ Loading Whisper STT Model (Warm Start)...")
@@ -58,6 +77,14 @@ class ConnectionManager:
                 print(f"Failed to send websocket message: {e}")
 
 manager = ConnectionManager()
+state_root = Path(__file__).resolve().parent / "state"
+identity_store = IdentityEnrollmentStore(
+    state_root / "identity_profiles"
+)
+identity_auditor = IdentityAuditor(
+    store=identity_store,
+    embedder=ECAPASpeakerEmbedder(savedir=state_root / "models" / "ecapa_voxceleb"),
+)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

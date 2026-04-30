@@ -170,3 +170,77 @@ Implemented an "Accept Call" UI flow, ensuring that microphone permissions, WebR
 Configured advanced `mediaDevices.getUserMedia` constraints to intentionally disable Android's native audio preprocessing (Echo Cancellation, Noise Suppression, and Auto Gain Control).
 
 This ensures the `RawNet2` neural network receives pure, uncompressed, and unaltered acoustic data, drastically improving the model's ability to detect synthetic audio signatures and presentation attacks.
+
+
+
+
+# 🛡️ Phase 2: Semantic Intent & Late Fusion Integration (DATE: 6/4/2026, AUTHOR: GEORGE HABIB)
+
+> **Multi-Modal Threat Detection | Parallel Microservices | Context-Aware AI Auditing**
+
+## 📖 Overview
+Phase 2 evolves the system from a single-threaded pipeline into a **Parallel Fan-Out Architecture**. The core `server.py` now acts as an intelligent API Gateway ("The Brain"), orchestrating concurrent AI microservices to analyze both the acoustic properties and semantic intent of incoming voice streams in real-time.
+
+## 🏗️ System Architecture
+
+### 🧠 Orchestrated API Gateway
+The gateway manages concurrent inference across three specialized microservices:
+- **🔊 Acoustic Auditor (`RawNet2`):** Detects synthetic voice artifacts and deepfake signatures by analyzing raw audio waveforms.
+- **📝 Semantic Auditor (`DistilBERT`):** Evaluates transcribed text for manipulative language, phishing intent, and social engineering patterns.
+- **🎙️ Whisper STT Engine:** Performs low-latency, on-device transcription of the encrypted WebRTC audio stream.
+
+## 🧠 Contextual Memory: The 21-Second Buffer
+To eliminate false positives from isolated keywords, the system implements a **Rolling Context Buffer**:
+- Audio is processed in `3-second chunks`
+- Maintains a sliding window of the `last 7 chunks` (~21 seconds of conversation)
+- Enables cross-sentence intent recognition (e.g., linking *"I'm calling from your bank"* at `t=5s` with *"Please verify your OTP"* at `t=18s`)
+
+## ⚖️ Late Fusion Decision Logic
+Instead of relying on a single modality, the gateway employs a custom **Late Fusion Layer** that mathematically combines acoustic and semantic confidence scores:
+
+$$ \text{Threat} = (P_{\text{acoustic}} > 0.5) \lor (P_{\text{semantic}} > 0.6) $$
+
+**Why this works:**
+- 🛡️ **Acoustic bypass:** If a deepfake is acoustically perfect (`P_acoustic < 0.5`), the semantic model can still trigger an alert.
+- 🗣️ **Contextual bypass:** If malicious intent is disguised in natural speech, the acoustic analyzer catches synthetic artifacts.
+- ⚡ **Low latency:** Parallel inference + weighted OR logic ensures real-time decisioning without blocking the WebRTC stream.
+
+## 🤖 Neural Semantic Fine-Tuning Pipeline *(In Progress)*
+Moving beyond keyword matching, we're fine-tuning `DistilBERT` on a domain-specific dataset:
+
+### 📊 Data Generation & Curation
+- **Synthetic Vishing Corpus:** LLM-generated transcripts covering modern attack vectors (crypto scams, AI voice cloning, OTP fraud)
+- **Public Dataset Integration:** Merged with UC Irvine SMS Spam Corpus
+- **Final Matrix:** ~2,500 balanced samples (`50/50` class distribution)
+
+### 🏷️ Class Distribution
+| Class | Label | Description |
+|-------|-------|-------------|
+| `0` | ✅ Safe | Everyday conversations & benign SMS |
+| `1` | ⚠️ Scam | Modern vishing scripts & malicious phishing texts |
+
+## 🚀 Next Steps
+- [ ] Complete DistilBERT fine-tuning & validation
+- [ ] Optimize chunk overlap & buffer windowing
+- [ ] Implement dynamic threshold adjustment based on user feedback
+- [ ] Add confidence scoring telemetry to the WebSocket stream
+
+---
+*Built for real-time, multi-modal threat detection. Phase 2 transforms reactive filtering into proactive, context-aware AI auditing.*
+
+
+
+
+# 🧠 Phase 3: Neural Semantic Fine-Tuning & Integration (DATE: 9/4/2026, AUTHOR: GEORGE HABIB)
+
+- Objective: Upgrade the Semantic Auditor from a basic Regex keyword-matcher to a deep learning text classifier capable of understanding manipulative intent and context.
+
+- Custom Model Fine-Tuning: Engineered a PyTorch training loop (train_model.py) using the Hugging Face Trainer API. We fine-tuned the distilbert-base-uncased model on a perfectly balanced, 2,500-row dataset of modern vishing transcripts and safe human conversations.
+
+- Anti-Overfitting Measures: Trained the model for 3 epochs with a load_best_model_at_end callback, automatically discarding overfitted epochs and securing a peak validation accuracy and F1 score of 99.0%.
+
+- Empirical QA Benchmarking: Developed a rigorous test suite (qa_model_comparison.py) pitting the legacy heuristic model against the new neural network using tricky edge cases (e.g., safe texts with "scary" keywords, or keyword-less emotional distress scams). The fine-tuned model demonstrated a 2x accuracy improvement (66.7% vs 33.3%) over the baseline.
+
+- Microservice Brain Transplant: Successfully migrated the ~260MB local model weights (.safetensors) directly into the distilbert-service directory, updating .gitignore protocols to safely bypass GitHub's 100MB file limits.
+
+- API Activation: Updated the main.py entry point to load the local custom model and flipped the USE_CLASSIFIER flag to True, officially switching the WebRTC pipeline's semantic analysis to the live neural network.

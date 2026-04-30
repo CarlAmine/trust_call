@@ -3,9 +3,11 @@ import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, PermissionsAndr
 import { mediaDevices, RTCPeerConnection, RTCSessionDescription } from 'react-native-webrtc';
 
 
-const CallScreen = ({ navigation }: any) => {
+const CallScreen = ({ navigation, route }: any) => {
   const [callDuration, setCallDuration] = useState(0);
   const [localStream, setLocalStream] = useState<any>(null);
+  const callerName = route?.params?.callerName ?? 'Unknown Caller';
+  const callerId = route?.params?.callerId ?? 'unknown';
   
   // Phase 2: New State Variables for WebRTC Pipe
   const [peerConnection, setPeerConnection] = useState<any>(null);
@@ -77,7 +79,11 @@ const CallScreen = ({ navigation }: any) => {
         const response = await fetch('http://10.0.2.2:8080/offer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+          body: JSON.stringify({
+            sdp: offer.sdp,
+            type: offer.type,
+            caller_id: callerId,
+          }),
         });
 
         const answer = await response.json();
@@ -160,7 +166,7 @@ const handleAcceptCall = () => {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.callerName}>Unknown Caller</Text>
+        <Text style={styles.callerName}>{callerName}</Text>
         <Text style={styles.callTime}>{formatTime(callDuration)}</Text>
       </View>
 
