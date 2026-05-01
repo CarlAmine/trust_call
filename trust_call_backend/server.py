@@ -3,16 +3,17 @@ import base64
 import io
 import os
 import tempfile
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from uuid import uuid4
 
 import httpx
 import numpy as np
 import soundfile as sf
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -58,6 +59,69 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+class MetricsRegistry:
+    def __init__(self):
+        self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = defaultdict(float)
+        self._lock = Lock()
+
+    def inc(self, name: str, amount: float = 1.0, **labels: str) -> None:
+        label_key = tuple(sorted((key, str(label_value)) for key, label_value in labels.items()))
+        with self._lock:
+            self._counters[(name, label_key)] += amount
+
+    def render(self, gauges: dict[str, float] | None = None) -> str:
+        lines = [
+            "# HELP trust_call_gateway_sessions_started_total Live call sessions started by source.",
+            "# TYPE trust_call_gateway_sessions_started_total counter",
+            "# HELP trust_call_gateway_audio_frames_total Audio frames received by the gateway.",
+            "# TYPE trust_call_gateway_audio_frames_total counter",
+            "# HELP trust_call_gateway_audio_chunks_total Audio chunks processed by the gateway.",
+            "# TYPE trust_call_gateway_audio_chunks_total counter",
+            "# HELP trust_call_iep3_identity_results_total IEP3 identity decisions by status.",
+            "# TYPE trust_call_iep3_identity_results_total counter",
+            "# HELP trust_call_iep3_candidate_embeddings_total TOFU candidate embeddings collected.",
+            "# TYPE trust_call_iep3_candidate_embeddings_total counter",
+            "# HELP trust_call_iep3_candidate_enrollments_total TOFU candidate enrollment outcomes.",
+            "# TYPE trust_call_iep3_candidate_enrollments_total counter",
+            "# HELP trust_call_gateway_fusion_results_total EEP fusion outcomes.",
+            "# TYPE trust_call_gateway_fusion_results_total counter",
+            "# HELP trust_call_gateway_errors_total Gateway errors recorded by source.",
+            "# TYPE trust_call_gateway_errors_total counter",
+        ]
+        with self._lock:
+            counters = list(self._counters.items())
+
+        for (name, labels), value in sorted(counters):
+            label_text = ""
+            if labels:
+                label_text = "{" + ",".join(
+                    f'{key}="{_escape_metric_label(label_value)}"'
+                    for key, label_value in labels
+                ) + "}"
+            lines.append(f"{name}{label_text} {value}")
+
+        if gauges:
+            lines.extend(
+                [
+                    "# HELP trust_call_gateway_active_sessions Active live sessions retained in memory.",
+                    "# TYPE trust_call_gateway_active_sessions gauge",
+                    "# HELP trust_call_iep3_enrolled_profiles Stored local IEP3 speaker profiles.",
+                    "# TYPE trust_call_iep3_enrolled_profiles gauge",
+                ]
+            )
+            for name, value in sorted(gauges.items()):
+                lines.append(f"{name} {value}")
+
+        return "\n".join(lines) + "\n"
+
+
+def _escape_metric_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+metrics = MetricsRegistry()
 
 
 class Offer(BaseModel):
@@ -137,6 +201,7 @@ class LiveIdentityMonitor:
     def start_session(self, caller_id: str, source: str) -> dict:
         session_id = str(uuid4())
         now = _utc_now()
+        metrics.inc("trust_call_gateway_sessions_started_total", source=source)
         session = {
             "session_id": session_id,
             "caller_id": caller_id,
@@ -197,6 +262,7 @@ class LiveIdentityMonitor:
             return
         now = _utc_now()
         session["frames_received"] = int(session["frames_received"]) + 1
+        metrics.inc("trust_call_gateway_audio_frames_total")
         session["sample_rate_hz"] = sample_rate
         session["last_frame_at_utc"] = now
         session["last_frame_shape"] = list(frame_shape)
@@ -217,6 +283,8 @@ class LiveIdentityMonitor:
 
         now = _utc_now()
         chunk_index = int(session["chunks_processed"]) + 1
+        metrics.inc("trust_call_gateway_audio_chunks_total")
+        metrics.inc("trust_call_iep3_identity_results_total", status=identity_result.status)
         event = {
             "chunk_index": chunk_index,
             "processed_at_utc": now,
@@ -256,6 +324,7 @@ class LiveIdentityMonitor:
 
         embeddings = session["candidate_embeddings"]
         embeddings.append(np.asarray(embedding, dtype=np.float32))
+        metrics.inc("trust_call_iep3_candidate_embeddings_total")
         session["candidate_embedding_metadata"].append(dict(metadata))
         session["candidate_status"] = "collecting"
         session["last_updated_at_utc"] = _utc_now()
@@ -279,6 +348,7 @@ class LiveIdentityMonitor:
         if session is None:
             return
         session["candidate_status"] = "enrolled"
+        metrics.inc("trust_call_iep3_candidate_enrollments_total", status="enrolled")
         session["candidate_enrollment_result"] = enrollment
         session["candidate_embeddings"] = []
         session["candidate_embedding_metadata"] = []
@@ -290,6 +360,8 @@ class LiveIdentityMonitor:
         if session is None:
             return None
         discarded = len(session["candidate_embeddings"])
+        if discarded:
+            metrics.inc("trust_call_iep3_candidate_enrollments_total", status="discarded")
         session["candidate_embeddings"] = []
         session["candidate_embedding_metadata"] = []
         session["candidate_status"] = "discarded" if discarded else "idle"
@@ -317,6 +389,7 @@ class LiveIdentityMonitor:
         session["last_semantic_label"] = semantic_label
         session["last_transcript"] = transcript
         session["last_fusion_status"] = fusion_status
+        metrics.inc("trust_call_gateway_fusion_results_total", status=fusion_status)
         session["state"] = "telemetry_broadcast"
         session["last_updated_at_utc"] = _utc_now()
 
@@ -325,12 +398,16 @@ class LiveIdentityMonitor:
         if session is None:
             return
         session["last_error"] = error
+        metrics.inc("trust_call_gateway_errors_total", source=session.get("source", "unknown"))
         session["state"] = "error"
         session["last_updated_at_utc"] = _utc_now()
 
     def list_sessions(self) -> list[dict]:
         sessions = [self._sessions[session_id] for session_id in reversed(self._order)]
         return [self._summary(session) for session in sessions]
+
+    def active_session_count(self) -> int:
+        return len(self._sessions)
 
     def get_session(self, session_id: str) -> dict | None:
         session = self._sessions.get(session_id)
@@ -411,6 +488,28 @@ identity_auditor = IdentityAuditor(
         savedir=identity_config.resolve_model_savedir(),
     ),
 )
+
+
+@app.get("/metrics")
+async def metrics_endpoint():
+    try:
+        profile_count = float(len(identity_store.load_all()))
+    except Exception:
+        profile_count = 0.0
+        metrics.inc("trust_call_gateway_errors_total", source="metrics")
+
+    body = metrics.render(
+        gauges={
+            "trust_call_gateway_active_sessions": float(live_identity_monitor.active_session_count()),
+            "trust_call_iep3_enrolled_profiles": profile_count,
+        }
+    )
+    return Response(
+        content=body,
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
+
+
 whisper_model = _load_whisper_model()
 
 
