@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView, PermissionsAndroid, Platform } from 'react-native';
+import { Alert, View, Text, TouchableOpacity, StyleSheet, SafeAreaView, PermissionsAndroid, Platform } from 'react-native';
 import { mediaDevices, RTCPeerConnection, RTCSessionDescription } from 'react-native-webrtc';
 import { getBackendHttpUrl, getBackendWsUrl, getResolvedBackendBaseUrl } from '../config/backend';
 
@@ -28,12 +28,17 @@ const CallScreen = ({ navigation, route }: any) => {
   const [fusionStatus, setFusionStatus] = useState<string>('WAITING');
   const [sessionId, setSessionId] = useState<string>('Not Connected');
   const [telemetryStatus, setTelemetryStatus] = useState<string>('Disconnected');
+  const [candidateEmbeddingCount, setCandidateEmbeddingCount] = useState<number>(0);
+  const [candidateStatus, setCandidateStatus] = useState<string>('Idle');
+  const [candidateEnrollmentReady, setCandidateEnrollmentReady] = useState<boolean>(false);
 
   const [signalColor, setSignalColor] = useState<string>('#4CAF50'); // Default Green
 
   const [isCallActive, setIsCallActive] = useState(false);
   
   const ws = useRef<WebSocket | null>(null);
+  const phoneNumber = route?.params?.phoneNumber ?? '';
+  const resolvedFromContacts = route?.params?.resolvedFromContacts === true;
 
   const formatPercent = (value: unknown): string => {
     if (value == null || value === '') {
@@ -81,6 +86,13 @@ const CallScreen = ({ navigation, route }: any) => {
     if (typeof chunkCount === 'number') {
       setIdentityChunks(chunkCount);
     }
+    if (typeof payload.candidate_embedding_count === 'number') {
+      setCandidateEmbeddingCount(payload.candidate_embedding_count);
+    }
+    if (typeof payload.candidate_enrollment_ready === 'boolean') {
+      setCandidateEnrollmentReady(payload.candidate_enrollment_ready);
+      setCandidateStatus(payload.candidate_enrollment_ready ? 'Ready to save' : 'Idle');
+    }
   };
 
   const applySessionSnapshot = (session: any) => {
@@ -92,6 +104,13 @@ const CallScreen = ({ navigation, route }: any) => {
         : '0.00s'
     );
     setIdentityChunks(typeof session.chunks_processed === 'number' ? session.chunks_processed : 0);
+    setCandidateEmbeddingCount(
+      typeof session.candidate_embedding_count === 'number'
+        ? session.candidate_embedding_count
+        : 0
+    );
+    setCandidateEnrollmentReady(session.candidate_enrollment_ready === true);
+    setCandidateStatus(String(session.candidate_status ?? 'Idle'));
 
     if (session.last_signal_score) {
       setSignalScore(session.last_signal_score);
@@ -283,7 +302,7 @@ const handleAcceptCall = () => {
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
   
-  const handleEndCall = () => {
+  const cleanupCallResources = () => {
     if (localStream) {
       localStream.getTracks().forEach((track: any) => track.stop());
     }
@@ -295,7 +314,77 @@ const handleAcceptCall = () => {
       ws.current.close();
     }
     // -----------------------------
-    navigation.navigate('HomeScreen');
+  };
+
+  const discardCandidateProfile = async (currentSessionId: string) => {
+    try {
+      await fetch(getBackendHttpUrl(`/identity/live/sessions/${currentSessionId}/candidate`), {
+        method: 'DELETE',
+      });
+    } catch (error) {
+      console.log('Failed to discard TOFU candidate embeddings:', error);
+    } finally {
+      navigation.navigate('HomeScreen');
+    }
+  };
+
+  const saveCandidateProfile = async (currentSessionId: string) => {
+    try {
+      const response = await fetch(
+        getBackendHttpUrl(`/identity/live/sessions/${currentSessionId}/enroll-candidate`),
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ safe_to_enroll: true }),
+        }
+      );
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || 'Failed to save voice profile.');
+      }
+
+      Alert.alert('Voice Profile Saved', `${callerName} is now enrolled for IEP3.`, [
+        { text: 'OK', onPress: () => navigation.navigate('HomeScreen') },
+      ]);
+    } catch (error: any) {
+      Alert.alert('Enrollment Failed', error?.message ?? 'Could not save this voice profile.', [
+        { text: 'OK', onPress: () => navigation.navigate('HomeScreen') },
+      ]);
+    }
+  };
+
+  const handleEndCall = () => {
+    const currentSessionId = sessionId;
+    const hasCandidateProfile =
+      candidateEnrollmentReady &&
+      candidateEmbeddingCount > 0 &&
+      currentSessionId !== 'Not Connected' &&
+      currentSessionId !== 'Unknown Session';
+
+    cleanupCallResources();
+    setIsCallActive(false);
+
+    if (!hasCandidateProfile) {
+      navigation.navigate('HomeScreen');
+      return;
+    }
+
+    Alert.alert(
+      'Save Voice Profile?',
+      `Trust-Call collected ${candidateEmbeddingCount} temporary voice embeddings for ${callerName}. Save them as the local master vector?`,
+      [
+        {
+          text: 'Discard',
+          style: 'destructive',
+          onPress: () => discardCandidateProfile(currentSessionId),
+        },
+        {
+          text: 'Save Profile',
+          onPress: () => saveCandidateProfile(currentSessionId),
+        },
+      ]
+    );
   };
 
   return (
@@ -304,6 +393,11 @@ const handleAcceptCall = () => {
         <Text style={styles.callerName}>{callerName}</Text>
         <Text style={styles.callTime}>{formatTime(callDuration)}</Text>
         <Text style={styles.sessionMeta}>Session: {formatSessionId(sessionId)}</Text>
+        {phoneNumber ? (
+          <Text style={styles.sessionMeta}>
+            {resolvedFromContacts ? 'Resolved contact' : 'Unmatched number'}: {phoneNumber}
+          </Text>
+        ) : null}
         <Text style={styles.sessionMeta}>Telemetry: {telemetryStatus}</Text>
       </View>
 
@@ -353,6 +447,15 @@ const handleAcceptCall = () => {
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Buffered</Text>
           <Text style={styles.metricValueSafe}>{bufferedSeconds}</Text>
+        </View>
+
+        <View style={styles.metricRow}>
+          <Text style={styles.metricLabel}>TOFU</Text>
+          <Text style={styles.metricValueSafe}>
+            {candidateEmbeddingCount > 0
+              ? `${candidateEmbeddingCount} samples (${candidateStatus})`
+              : candidateStatus}
+          </Text>
         </View>
 
         <View style={styles.metricRow}>

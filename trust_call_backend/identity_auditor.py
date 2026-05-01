@@ -52,6 +52,7 @@ IDENTITY_STATUS_CONTRACT = {
     "low_energy": "The speech segment is too quiet for reliable verification.",
     "profile_incompatible": "The stored profile was created with a different embedder.",
     "model_unavailable": "The speaker verification model could not be loaded.",
+    "candidate_collecting": "Temporary TOFU embeddings are being collected for this caller.",
     "match": "The current speaker matches the enrolled profile.",
     "review": "The current speaker is borderline and should be corroborated.",
     "mismatch": "The current speaker does not match the enrolled profile.",
@@ -112,6 +113,35 @@ class IdentityResult:
     candidate_count: int = 0
     candidates: list[dict[str, Any]] | None = None
 
+    def confidence_level(self) -> str:
+        if self.match_confidence is None:
+            return "none"
+        if self.status == "match":
+            return "high"
+        if self.status == "review":
+            return "medium"
+        if self.status == "mismatch":
+            return "low"
+        return "none"
+
+    def to_eep_response(self) -> dict[str, Any]:
+        similarity = (
+            round(self.match_confidence, 6)
+            if self.match_confidence is not None
+            else None
+        )
+        mismatch = round(1.0 - self.match_confidence, 6) if similarity is not None else None
+        return {
+            "iep": "identity",
+            "contact_id": self.caller_id,
+            "status": self.status,
+            "similarity": similarity,
+            "mismatch": mismatch,
+            "confidence": self.confidence_level(),
+            "enrolled": self.enrolled,
+            "reason": self.reason,
+        }
+
     def to_telemetry(self) -> dict[str, Any]:
         return {
             "caller_id": self.caller_id,
@@ -133,6 +163,9 @@ class IdentityResult:
             "identity_status": self.status,
             "identity_reason": self.reason,
             "identity_enrolled": self.enrolled,
+            "identity_mismatch": round(self.identity_score, 6),
+            "identity_confidence_level": self.confidence_level(),
+            "identity_eep": self.to_eep_response(),
         }
 
     def to_api_response(self) -> dict[str, Any]:
@@ -148,10 +181,13 @@ class IdentityResult:
             "match_confidence": round(self.match_confidence, 6)
             if self.match_confidence is not None
             else None,
+            "mismatch": round(self.identity_score, 6),
+            "confidence": self.confidence_level(),
             "display_text": self.display_text,
             "reason": self.reason,
             "enrolled": self.enrolled,
             "duration_seconds": round(self.duration_seconds, 6),
+            "eep": self.to_eep_response(),
         }
 
 
@@ -450,6 +486,98 @@ class IdentityAuditor:
             if mode == "ema_update"
             else None,
         }
+
+    def enroll_from_embeddings(
+        self,
+        caller_id: str,
+        embeddings: list[np.ndarray],
+        metadata: list[dict[str, float]] | None = None,
+        safe_to_enroll: bool = False,
+    ) -> dict[str, Any]:
+        if not caller_id or caller_id == "unknown":
+            raise IdentityPolicyError(
+                code="missing_caller_id",
+                message="A resolved caller identity is required before TOFU enrollment.",
+                http_status=400,
+            )
+        if not embeddings:
+            raise IdentityPolicyError(
+                code="candidate_embeddings_missing",
+                message="No temporary voice embeddings were collected for this live session.",
+                http_status=409,
+            )
+        if self.store.load(caller_id) is not None:
+            raise IdentityPolicyError(
+                code="identity_profile_already_exists",
+                message="A profile already exists for this caller. Use EMA update policy instead.",
+                http_status=409,
+            )
+        if self.config.require_safe_call_confirmation_for_enrollment and not safe_to_enroll:
+            raise IdentityPolicyError(
+                code="tofu_requires_safe_call_confirmation",
+                message="TOFU enrollment is blocked until the call is explicitly marked safe.",
+                http_status=403,
+            )
+
+        vectors = [
+            _l2_normalize(np.asarray(embedding, dtype=np.float32).reshape(-1))
+            for embedding in embeddings
+        ]
+        dimensions = {int(vector.shape[0]) for vector in vectors}
+        if len(dimensions) != 1:
+            raise IdentityPolicyError(
+                code="candidate_embedding_dim_mismatch",
+                message="Temporary embeddings have incompatible dimensions.",
+                http_status=409,
+            )
+
+        averaged_embedding = _l2_normalize(np.mean(np.stack(vectors), axis=0))
+        metadata = metadata or []
+        durations = [
+            float(item["duration_seconds"])
+            for item in metadata
+            if "duration_seconds" in item
+        ]
+        rms_values = [float(item["rms"]) for item in metadata if "rms" in item]
+        now = _utc_now()
+        payload = {
+            "caller_id": caller_id,
+            "embedder": self.embedder.name,
+            "model_source": self.embedder.model_source,
+            "embedding": averaged_embedding.tolist(),
+            "embedding_dim": int(averaged_embedding.shape[0]),
+            "created_at_utc": now,
+            "updated_at_utc": now,
+            "num_updates": 0,
+            "last_duration_seconds": round(float(np.mean(durations)), 6)
+            if durations
+            else None,
+            "last_rms": round(float(np.mean(rms_values)), 8) if rms_values else None,
+            "target_sample_rate_hz": self.embedder.target_sample_rate,
+            "candidate_embedding_count": len(vectors),
+            "enrollment_source": "live_tofu_session",
+        }
+        self.store.save(caller_id, payload)
+        return {
+            "caller_id": caller_id,
+            "enrolled": True,
+            "mode": "tofu_live_session",
+            "updated": False,
+            "embedder": self.embedder.name,
+            "duration_seconds": payload["last_duration_seconds"],
+            "rms": payload["last_rms"],
+            "embedding_dim": int(averaged_embedding.shape[0]),
+            "num_updates": 0,
+            "safe_to_enroll": safe_to_enroll,
+            "candidate_embedding_count": len(vectors),
+        }
+
+    def extract_candidate_embedding(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+    ) -> tuple[np.ndarray, dict[str, float]]:
+        return self.embedder.extract(audio, sample_rate)
 
     def verify_chunk(
         self,

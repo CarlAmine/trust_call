@@ -1,21 +1,32 @@
 import React, { useEffect, useState } from 'react';
 import {
   Alert,
+  NativeModules,
   PermissionsAndroid,
   Platform,
   SafeAreaView,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   TouchableOpacity,
   View,
 } from 'react-native';
 import { getBackendHttpUrl } from '../config/backend';
 
+type PhoneContact = {
+  id: string;
+  name: string;
+  phoneNumber?: string;
+};
+
 type TrustedContact = {
   callerId: string;
   callerName: string;
   label: string;
+  phoneNumber?: string;
+  phoneDigits?: string;
+  source: 'phone' | 'demo';
 };
 
 type EnrollmentStatus = {
@@ -26,21 +37,38 @@ type EnrollmentStatus = {
   num_updates?: number;
 };
 
-const TRUSTED_CONTACTS: TrustedContact[] = [
+type TrustCallContactsModule = {
+  getContacts: () => Promise<PhoneContact[]>;
+};
+
+const { TrustCallContacts } = NativeModules as {
+  TrustCallContacts?: TrustCallContactsModule;
+};
+
+const DEMO_CONTACTS: TrustedContact[] = [
   {
     callerId: 'alice_demo',
     callerName: 'Alice Demo',
-    label: 'Primary demo profile',
+    label: '+1 555 0101',
+    phoneNumber: '+1 555 0101',
+    phoneDigits: '15550101',
+    source: 'demo',
   },
   {
     callerId: 'mom_demo',
     callerName: 'Mom Demo',
-    label: 'Trusted family contact',
+    label: '+1 555 0102',
+    phoneNumber: '+1 555 0102',
+    phoneDigits: '15550102',
+    source: 'demo',
   },
   {
     callerId: 'bank_contact',
     callerName: 'Bank Contact',
-    label: 'High-risk caller profile',
+    label: '+1 555 0103',
+    phoneNumber: '+1 555 0103',
+    phoneDigits: '15550103',
+    source: 'demo',
   },
 ];
 
@@ -49,32 +77,95 @@ const UNKNOWN_INCOMING_CALL = {
   callerName: 'Unknown Caller',
 };
 
-const requestCallPermissions = async () => {
+const normalizePhoneDigits = (value?: string): string => (value ?? '').replace(/\D/g, '');
+
+const callerIdFromPhoneDigits = (digits: string): string => `contact_${digits || 'unknown'}`;
+
+const normalizeCallerId = (contact: PhoneContact): string => {
+  const phoneDigits = normalizePhoneDigits(contact.phoneNumber);
+  const stableValue = phoneDigits || contact.id || contact.name;
+  const normalized = stableValue.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return `contact_${normalized || 'unknown'}`;
+};
+
+const toTrustedContact = (contact: PhoneContact): TrustedContact => {
+  const phoneDigits = normalizePhoneDigits(contact.phoneNumber);
+  return {
+    callerId: phoneDigits ? callerIdFromPhoneDigits(phoneDigits) : normalizeCallerId(contact),
+    callerName: contact.name || contact.phoneNumber || 'Unnamed Contact',
+    label: contact.phoneNumber || 'Phone contact',
+    phoneNumber: contact.phoneNumber,
+    phoneDigits,
+    source: 'phone',
+  };
+};
+
+const phoneNumbersMatch = (left?: string, right?: string) => {
+  const leftDigits = normalizePhoneDigits(left);
+  const rightDigits = normalizePhoneDigits(right);
+  if (!leftDigits || !rightDigits) return false;
+  if (leftDigits === rightDigits) return true;
+
+  const suffixLength = Math.min(leftDigits.length, rightDigits.length, 10);
+  return suffixLength >= 7 && leftDigits.slice(-suffixLength) === rightDigits.slice(-suffixLength);
+};
+
+const requestAndroidPermission = async (
+  permission: string,
+  title: string,
+  message: string,
+) => {
   if (Platform.OS !== 'android') return true;
 
+  const granted = await PermissionsAndroid.request(permission as any, {
+    title,
+    message,
+    buttonNeutral: 'Ask Me Later',
+    buttonNegative: 'Cancel',
+    buttonPositive: 'OK',
+  });
+
+  return granted === PermissionsAndroid.RESULTS.GRANTED;
+};
+
+const requestCallPermissions = async () => {
   try {
-    const granted = await PermissionsAndroid.request(
+    const granted = await requestAndroidPermission(
       PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-      {
-        title: 'Trust Call Microphone Permission',
-        message: 'Trust Call needs microphone access to analyze live call audio.',
-        buttonNeutral: 'Ask Me Later',
-        buttonNegative: 'Cancel',
-        buttonPositive: 'OK',
-      },
+      'Trust Call Microphone Permission',
+      'Trust Call needs microphone access to analyze live call audio.',
     );
 
-    if (granted === PermissionsAndroid.RESULTS.GRANTED) {
-      return true;
+    if (!granted) {
+      Alert.alert(
+        'Microphone Required',
+        'Trust Call needs microphone access before it can verify the caller voice.',
+      );
     }
-
-    Alert.alert(
-      'Microphone Required',
-      'Trust Call needs microphone access before it can verify the caller voice.',
-    );
-    return false;
+    return granted;
   } catch (err) {
-    console.warn('Error requesting permissions:', err);
+    console.warn('Error requesting microphone permission:', err);
+    return false;
+  }
+};
+
+const requestContactsPermission = async () => {
+  try {
+    const granted = await requestAndroidPermission(
+      PermissionsAndroid.PERMISSIONS.READ_CONTACTS,
+      'Trust Call Contacts Permission',
+      'Trust Call uses contacts so you can choose whose voice profile to verify.',
+    );
+
+    if (!granted) {
+      Alert.alert(
+        'Contacts Unavailable',
+        'Trust Call will show demo contacts until contacts access is allowed.',
+      );
+    }
+    return granted;
+  } catch (err) {
+    console.warn('Error requesting contacts permission:', err);
     return false;
   }
 };
@@ -89,21 +180,38 @@ const formatStatusDetail = (status?: EnrollmentStatus) => {
 };
 
 const HomeScreen = ({ navigation }: any) => {
-  const [selectedCallerId, setSelectedCallerId] = useState(TRUSTED_CONTACTS[0].callerId);
+  const [contacts, setContacts] = useState<TrustedContact[]>(DEMO_CONTACTS);
+  const [selectedCallerId, setSelectedCallerId] = useState(DEMO_CONTACTS[0].callerId);
   const [enrollmentByCallerId, setEnrollmentByCallerId] = useState<
     Record<string, EnrollmentStatus | undefined>
   >({});
   const [backendStatus, setBackendStatus] = useState('Checking backend');
+  const [contactsStatus, setContactsStatus] = useState('Demo contacts loaded');
+  const [searchText, setSearchText] = useState('');
+  const [incomingPhoneNumber, setIncomingPhoneNumber] = useState('+1 555 0101');
 
   const selectedContact =
-    TRUSTED_CONTACTS.find((contact) => contact.callerId === selectedCallerId) ??
-    TRUSTED_CONTACTS[0];
+    contacts.find((contact) => contact.callerId === selectedCallerId) ?? contacts[0];
 
-  const refreshEnrollmentStatuses = async () => {
+  const visibleContacts = contacts.filter((contact) => {
+    const query = searchText.trim().toLowerCase();
+    if (!query) return true;
+    return (
+      contact.callerName.toLowerCase().includes(query) ||
+      contact.label.toLowerCase().includes(query)
+    );
+  });
+
+  const resolveIncomingContact = (phoneNumber: string): TrustedContact | undefined =>
+    contacts.find((contact) => phoneNumbersMatch(contact.phoneNumber ?? contact.label, phoneNumber));
+
+  const refreshEnrollmentStatuses = async (contactsToCheck = contacts) => {
+    if (contactsToCheck.length === 0) return;
+
     setBackendStatus('Checking backend');
     try {
       const entries = await Promise.all(
-        TRUSTED_CONTACTS.map(async (contact) => {
+        contactsToCheck.map(async (contact) => {
           const response = await fetch(
             getBackendHttpUrl(`/identity/enrollment/${contact.callerId}`),
           );
@@ -123,19 +231,92 @@ const HomeScreen = ({ navigation }: any) => {
     }
   };
 
+  const loadPhoneContacts = async () => {
+    if (Platform.OS !== 'android' || !TrustCallContacts) {
+      setContacts(DEMO_CONTACTS);
+      setSelectedCallerId(DEMO_CONTACTS[0].callerId);
+      setContactsStatus('Demo contacts loaded');
+      await refreshEnrollmentStatuses(DEMO_CONTACTS);
+      return;
+    }
+
+    const hasContactsPermission = await requestContactsPermission();
+    if (!hasContactsPermission) {
+      setContacts(DEMO_CONTACTS);
+      setSelectedCallerId(DEMO_CONTACTS[0].callerId);
+      setContactsStatus('Demo contacts loaded');
+      await refreshEnrollmentStatuses(DEMO_CONTACTS);
+      return;
+    }
+
+    try {
+      const phoneContacts = await TrustCallContacts.getContacts();
+      const trustedContacts = phoneContacts.map(toTrustedContact).slice(0, 100);
+
+      if (trustedContacts.length === 0) {
+        setContacts(DEMO_CONTACTS);
+        setSelectedCallerId(DEMO_CONTACTS[0].callerId);
+        setContactsStatus('No phone contacts found');
+        await refreshEnrollmentStatuses(DEMO_CONTACTS);
+        return;
+      }
+
+      setContacts(trustedContacts);
+      setSelectedCallerId(trustedContacts[0].callerId);
+      setContactsStatus(`${trustedContacts.length} phone contacts loaded`);
+      await refreshEnrollmentStatuses(trustedContacts);
+    } catch (error) {
+      console.warn('Failed to load phone contacts:', error);
+      setContacts(DEMO_CONTACTS);
+      setSelectedCallerId(DEMO_CONTACTS[0].callerId);
+      setContactsStatus('Demo contacts loaded');
+      await refreshEnrollmentStatuses(DEMO_CONTACTS);
+    }
+  };
+
   useEffect(() => {
-    const unsubscribe = navigation.addListener('focus', refreshEnrollmentStatuses);
-    refreshEnrollmentStatuses();
+    const unsubscribe = navigation.addListener('focus', loadPhoneContacts);
+    loadPhoneContacts();
     return unsubscribe;
   }, [navigation]);
 
   const startSelectedContactCall = async () => {
     const hasPermission = await requestCallPermissions();
-    if (!hasPermission) return;
+    if (!hasPermission || !selectedContact) return;
 
     navigation.navigate('CallScreen', {
       callerId: selectedContact.callerId,
       callerName: selectedContact.callerName,
+      phoneNumber: selectedContact.phoneNumber,
+      resolvedFromContacts: selectedContact.source === 'phone',
+    });
+  };
+
+  const startIncomingPhoneCall = async () => {
+    const digits = normalizePhoneDigits(incomingPhoneNumber);
+    if (!digits) {
+      Alert.alert('Incoming Number Required', 'Enter the caller phone number to resolve it.');
+      return;
+    }
+
+    const hasPermission = await requestCallPermissions();
+    if (!hasPermission) return;
+
+    const resolvedContact = resolveIncomingContact(incomingPhoneNumber);
+    const caller = resolvedContact ?? {
+      callerId: callerIdFromPhoneDigits(digits),
+      callerName: `Unknown ${incomingPhoneNumber.trim()}`,
+      label: incomingPhoneNumber.trim(),
+      phoneNumber: incomingPhoneNumber.trim(),
+      phoneDigits: digits,
+      source: 'demo' as const,
+    };
+
+    navigation.navigate('CallScreen', {
+      callerId: caller.callerId,
+      callerName: caller.callerName,
+      phoneNumber: caller.phoneNumber,
+      resolvedFromContacts: Boolean(resolvedContact),
     });
   };
 
@@ -146,7 +327,9 @@ const HomeScreen = ({ navigation }: any) => {
     navigation.navigate('CallScreen', UNKNOWN_INCOMING_CALL);
   };
 
-  const selectedStatus = enrollmentByCallerId[selectedContact.callerId];
+  const selectedStatus = selectedContact
+    ? enrollmentByCallerId[selectedContact.callerId]
+    : undefined;
 
   return (
     <SafeAreaView style={styles.container}>
@@ -160,25 +343,53 @@ const HomeScreen = ({ navigation }: any) => {
             ]}>
             {backendStatus}
           </Text>
+          <Text style={styles.statusText}>{contactsStatus}</Text>
           <Text style={styles.statusText}>Local speaker profiles: encrypted JSON store</Text>
+        </View>
+
+        <View style={styles.incomingPanel}>
+          <Text style={styles.selectedEyebrow}>Incoming Call Resolution</Text>
+          <Text style={styles.incomingHelp}>
+            Enter a caller number. Trust-Call normalizes it, matches phone contacts, and
+            uses the resolved contact ID for 1:1 IEP3 verification or TOFU enrollment.
+          </Text>
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Incoming phone number"
+            placeholderTextColor="#777"
+            keyboardType="phone-pad"
+            value={incomingPhoneNumber}
+            onChangeText={setIncomingPhoneNumber}
+          />
+          <TouchableOpacity style={styles.primaryButton} onPress={startIncomingPhoneCall}>
+            <Text style={styles.primaryButtonText}>Simulate Incoming Number</Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Trusted Contacts</Text>
-          <TouchableOpacity style={styles.refreshButton} onPress={refreshEnrollmentStatuses}>
+          <TouchableOpacity style={styles.refreshButton} onPress={loadPhoneContacts}>
             <Text style={styles.refreshButtonText}>Refresh</Text>
           </TouchableOpacity>
         </View>
 
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search contacts"
+          placeholderTextColor="#777"
+          value={searchText}
+          onChangeText={setSearchText}
+        />
+
         <View style={styles.contactList}>
-          {TRUSTED_CONTACTS.map((contact) => {
+          {visibleContacts.map((contact) => {
             const status = enrollmentByCallerId[contact.callerId];
-            const isSelected = contact.callerId === selectedContact.callerId;
+            const isSelected = contact.callerId === selectedContact?.callerId;
             const isEnrolled = status?.enrolled === true;
 
             return (
               <TouchableOpacity
-                key={contact.callerId}
+                key={`${contact.callerId}-${contact.label}`}
                 style={[styles.contactCard, isSelected && styles.contactCardSelected]}
                 onPress={() => setSelectedCallerId(contact.callerId)}>
                 <View style={styles.contactTextBlock}>
@@ -200,11 +411,14 @@ const HomeScreen = ({ navigation }: any) => {
           })}
         </View>
 
-        <View style={styles.selectedPanel}>
-          <Text style={styles.selectedEyebrow}>Selected Caller</Text>
-          <Text style={styles.selectedName}>{selectedContact.callerName}</Text>
-          <Text style={styles.selectedStatus}>{formatStatusDetail(selectedStatus)}</Text>
-        </View>
+        {selectedContact ? (
+          <View style={styles.selectedPanel}>
+            <Text style={styles.selectedEyebrow}>Selected Caller</Text>
+            <Text style={styles.selectedName}>{selectedContact.callerName}</Text>
+            <Text style={styles.selectedStatus}>{formatStatusDetail(selectedStatus)}</Text>
+            <Text style={styles.selectedCallerId}>{selectedContact.callerId}</Text>
+          </View>
+        ) : null}
 
         <View style={styles.actions}>
           <TouchableOpacity style={styles.primaryButton} onPress={startSelectedContactCall}>
@@ -257,6 +471,20 @@ const styles = StyleSheet.create({
     fontSize: 14,
     marginTop: 5,
   },
+  incomingPanel: {
+    backgroundColor: '#181F18',
+    borderColor: '#2E7D32',
+    borderRadius: 12,
+    borderWidth: 1,
+    marginTop: 20,
+    padding: 18,
+    gap: 12,
+  },
+  incomingHelp: {
+    color: '#CFCFCF',
+    fontSize: 13,
+    lineHeight: 19,
+  },
   sectionHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -280,6 +508,17 @@ const styles = StyleSheet.create({
     color: '#CFCFCF',
     fontSize: 13,
     fontWeight: '600',
+  },
+  searchInput: {
+    backgroundColor: '#1A1A1A',
+    borderColor: '#333',
+    borderRadius: 10,
+    borderWidth: 1,
+    color: '#FFFFFF',
+    fontSize: 16,
+    marginBottom: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
   },
   contactList: {
     gap: 10,
@@ -359,6 +598,11 @@ const styles = StyleSheet.create({
     color: '#CFCFCF',
     fontSize: 14,
     marginTop: 6,
+  },
+  selectedCallerId: {
+    color: '#777',
+    fontSize: 12,
+    marginTop: 8,
   },
   actions: {
     marginTop: 24,

@@ -79,8 +79,14 @@ class LiveIdentityValidationPayload(BaseModel):
     base64_audio: str
     session_id: str | None = None
     dispatch_signal_auditor: bool = False
-    identify_if_unenrolled: bool = True
+    identify_if_unenrolled: bool = False
     top_k: int = Field(default=3, ge=1, le=10)
+
+
+class LiveSessionEnrollmentPayload(BaseModel):
+    safe_to_enroll: bool = True
+    synthetic_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    coercion_score: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ConnectionManager:
@@ -139,6 +145,10 @@ class LiveIdentityMonitor:
             "last_signal_score": None,
             "last_signal_threat": None,
             "last_error": None,
+            "candidate_embeddings": [],
+            "candidate_embedding_metadata": [],
+            "candidate_status": "idle",
+            "candidate_enrollment_result": None,
         }
         self._sessions[session_id] = session
         self._order.append(session_id)
@@ -193,6 +203,8 @@ class LiveIdentityMonitor:
             "processed_at_utc": now,
             "sample_rate_hz": sample_rate,
             "chunk_peak": round(float(chunk_peak), 4),
+            "candidate_embedding_count": len(session["candidate_embeddings"]),
+            "candidate_enrollment_ready": bool(session["candidate_embeddings"]),
             **identity_result.to_api_response(),
         }
         session["chunks_processed"] = chunk_index
@@ -200,7 +212,11 @@ class LiveIdentityMonitor:
         session["last_chunk_peak"] = event["chunk_peak"]
         session["last_chunk_duration_seconds"] = event["duration_seconds"]
         session["last_identity_result"] = event
-        session["state"] = "identity_verified"
+        session["state"] = (
+            "candidate_collecting"
+            if identity_result.status == "candidate_collecting"
+            else "identity_verified"
+        )
         session["last_updated_at_utc"] = now
 
         recent_events = session["recent_identity_events"]
@@ -208,6 +224,58 @@ class LiveIdentityMonitor:
         if len(recent_events) > self.max_events_per_session:
             del recent_events[0 : len(recent_events) - self.max_events_per_session]
         return event
+
+    def record_candidate_embedding(
+        self,
+        session_id: str,
+        embedding: np.ndarray,
+        metadata: dict[str, float],
+    ) -> int:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return 0
+
+        embeddings = session["candidate_embeddings"]
+        embeddings.append(np.asarray(embedding, dtype=np.float32))
+        session["candidate_embedding_metadata"].append(dict(metadata))
+        session["candidate_status"] = "collecting"
+        session["last_updated_at_utc"] = _utc_now()
+        return len(embeddings)
+
+    def get_candidate_embeddings(
+        self,
+        session_id: str,
+    ) -> tuple[str, list[np.ndarray], list[dict[str, float]]] | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        return (
+            session["caller_id"],
+            list(session["candidate_embeddings"]),
+            list(session["candidate_embedding_metadata"]),
+        )
+
+    def mark_candidate_enrolled(self, session_id: str, enrollment: dict) -> None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return
+        session["candidate_status"] = "enrolled"
+        session["candidate_enrollment_result"] = enrollment
+        session["candidate_embeddings"] = []
+        session["candidate_embedding_metadata"] = []
+        session["state"] = "candidate_enrolled"
+        session["last_updated_at_utc"] = _utc_now()
+
+    def discard_candidate_embeddings(self, session_id: str) -> int | None:
+        session = self._sessions.get(session_id)
+        if session is None:
+            return None
+        discarded = len(session["candidate_embeddings"])
+        session["candidate_embeddings"] = []
+        session["candidate_embedding_metadata"] = []
+        session["candidate_status"] = "discarded" if discarded else "idle"
+        session["last_updated_at_utc"] = _utc_now()
+        return discarded
 
     def record_signal_result(self, session_id: str, signal_score: str, is_threat: bool) -> None:
         session = self._sessions.get(session_id)
@@ -261,6 +329,10 @@ class LiveIdentityMonitor:
             "last_chunk_peak": session["last_chunk_peak"],
             "last_chunk_duration_seconds": session["last_chunk_duration_seconds"],
             "last_identity_result": session["last_identity_result"],
+            "candidate_embedding_count": len(session["candidate_embeddings"]),
+            "candidate_enrollment_ready": bool(session["candidate_embeddings"]),
+            "candidate_status": session["candidate_status"],
+            "candidate_enrollment_result": session["candidate_enrollment_result"],
         }
 
 
@@ -324,6 +396,51 @@ async def get_live_identity_session(session_id: str):
     if session is None:
         raise HTTPException(status_code=404, detail="Live identity session not found")
     return session
+
+
+@app.post("/identity/live/sessions/{session_id}/enroll-candidate")
+async def enroll_live_identity_candidate(
+    session_id: str,
+    payload: LiveSessionEnrollmentPayload,
+):
+    candidate = live_identity_monitor.get_candidate_embeddings(session_id)
+    if candidate is None:
+        raise HTTPException(status_code=404, detail="Live identity session not found")
+
+    caller_id, embeddings, metadata = candidate
+    try:
+        enrollment = identity_auditor.enroll_from_embeddings(
+            caller_id=caller_id,
+            embeddings=embeddings,
+            metadata=metadata,
+            safe_to_enroll=payload.safe_to_enroll,
+        )
+    except IdentityPolicyError as exc:
+        raise HTTPException(status_code=exc.http_status, detail=exc.to_response()) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    live_identity_monitor.mark_candidate_enrolled(session_id, enrollment)
+    return {
+        "session_id": session_id,
+        "caller_id": caller_id,
+        "enrollment": enrollment,
+        "session": live_identity_monitor.get_session(session_id),
+    }
+
+
+@app.delete("/identity/live/sessions/{session_id}/candidate")
+async def discard_live_identity_candidate(session_id: str):
+    discarded = live_identity_monitor.discard_candidate_embeddings(session_id)
+    if discarded is None:
+        raise HTTPException(status_code=404, detail="Live identity session not found")
+    return {
+        "session_id": session_id,
+        "discarded_candidate_embedding_count": discarded,
+        "session": live_identity_monitor.get_session(session_id),
+    }
 
 
 @app.post("/identity/enroll")
@@ -427,6 +544,8 @@ def build_fusion_status(identity_result: IdentityResult) -> str:
         return "IDENTITY REVIEW"
     if identity_result.status in {"review", "identity_candidate"}:
         return "IDENTITY CAUTION"
+    if identity_result.status == "candidate_collecting":
+        return "LEARNING VOICE"
     return "ANALYZING"
 
 
@@ -460,6 +579,9 @@ async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult, ses
     finally:
         live_identity_monitor.record_signal_result(session_id, signal_score, is_threat)
         session = live_identity_monitor.get_session(session_id)
+        candidate_embedding_count = (
+            session["candidate_embedding_count"] if session is not None else 0
+        )
         await manager.broadcast(
             {
                 "session_id": session_id,
@@ -471,6 +593,8 @@ async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult, ses
                 "identity_chunk_count": (
                     session["chunks_processed"] if session is not None else None
                 ),
+                "candidate_embedding_count": candidate_embedding_count,
+                "candidate_enrollment_ready": candidate_embedding_count > 0,
                 **identity_result.to_telemetry(),
             }
         )
@@ -478,6 +602,9 @@ async def send_to_rawnet(base64_audio: str, identity_result: IdentityResult, ses
 
 async def broadcast_identity_telemetry(identity_result: IdentityResult, session_id: str) -> None:
     session = live_identity_monitor.get_session(session_id)
+    candidate_embedding_count = (
+        session["candidate_embedding_count"] if session is not None else 0
+    )
     await manager.broadcast(
         {
             "session_id": session_id,
@@ -489,6 +616,8 @@ async def broadcast_identity_telemetry(identity_result: IdentityResult, session_
             "identity_chunk_count": (
                 session["chunks_processed"] if session is not None else None
             ),
+            "candidate_embedding_count": candidate_embedding_count,
+            "candidate_enrollment_ready": candidate_embedding_count > 0,
             **identity_result.to_telemetry(),
         }
     )
@@ -500,7 +629,7 @@ async def process_identity_chunk(
     sample_rate: int,
     session_id: str,
     dispatch_signal_auditor: bool = True,
-    identify_if_unenrolled: bool = True,
+    identify_if_unenrolled: bool = False,
     top_k: int = 3,
 ) -> IdentityResult:
     identity_result = identity_auditor.verify_chunk(
@@ -519,6 +648,35 @@ async def process_identity_chunk(
             claimed_caller_id=caller_id,
             top_k=top_k,
         )
+    elif identity_result.status == "not_enrolled":
+        try:
+            embedding, metadata = identity_auditor.extract_candidate_embedding(
+                audio=audio,
+                sample_rate=sample_rate,
+            )
+            candidate_count = live_identity_monitor.record_candidate_embedding(
+                session_id=session_id,
+                embedding=embedding,
+                metadata=metadata,
+            )
+            identity_result = IdentityResult(
+                caller_id=caller_id,
+                status="candidate_collecting",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text=f"Collecting TOFU ({candidate_count})",
+                reason="temporary_embeddings_buffered_until_user_confirmation",
+                enrolled=False,
+                duration_seconds=identity_result.duration_seconds,
+                identification_mode="tofu_candidate",
+                identified_caller_id=None,
+                candidate_count=candidate_count,
+            )
+        except ValueError as exc:
+            print(f"Skipped TOFU candidate chunk: {exc}")
+        except RuntimeError as exc:
+            print(f"Unable to collect TOFU candidate chunk: {exc}")
     chunk_peak = float(np.max(np.abs(np.asarray(audio)))) if np.asarray(audio).size else 0.0
     live_identity_monitor.record_chunk(
         session_id=session_id,
@@ -543,6 +701,7 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
     audio_buffer = []
     sample_rate = 0
     target_seconds = 3.0
+    overlap_ratio = 0.5
     chunk_counter = 0
 
     while True:
@@ -571,19 +730,21 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
 
             if current_duration >= target_seconds:
                 chunk_counter += 1
-                combined_audio = np.concatenate(audio_buffer, axis=1).T
-                max_volume = np.max(np.abs(combined_audio))
+                combined_audio = np.concatenate(audio_buffer, axis=1)
+                chunk_audio = combined_audio.T
+                max_volume = np.max(np.abs(chunk_audio))
                 print(
                     f"Dispatching live chunk {chunk_counter} | peak={float(max_volume):.2f}"
                 )
                 await process_identity_chunk(
                     caller_id=caller_id,
-                    audio=combined_audio,
+                    audio=chunk_audio,
                     sample_rate=sample_rate,
                     session_id=session_id,
                     dispatch_signal_auditor=True,
                 )
-                audio_buffer.clear()
+                overlap_samples = max(int(sample_rate * target_seconds * overlap_ratio), 1)
+                audio_buffer = [combined_audio[:, -overlap_samples:]]
         except Exception as exc:
             print(f"Audio stream ended or disconnected: {exc}")
             live_identity_monitor.record_error(session_id, str(exc))
