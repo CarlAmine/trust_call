@@ -209,6 +209,13 @@ __marimo__/
 
 # Trust-Call Raw Data Exclusions
 data/
+!data/
+data/*
+!data/evaluation/
+data/evaluation/*
+!data/evaluation/iep3/
+data/evaluation/iep3/*
+!data/evaluation/iep3/README.md
 datasets/
 *.wav
 *.flac
@@ -226,6 +233,7 @@ TrustCallApp/node_modules/
 
 # Android Build Caches
 TrustCallApp/android/.gradle/
+TrustCallApp/.gradle-local/
 TrustCallApp/android/build/
 TrustCallApp/android/app/build/
 TrustCallApp/android/app/.cxx/
