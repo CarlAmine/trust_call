@@ -9,14 +9,14 @@ scrape_configs:
   - job_name: 'rawnet_audio_ai'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['host.docker.internal:8000']
+      - targets: ['rawnet-service:8000']
 
   - job_name: 'distilbert_semantic_ai'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['host.docker.internal:8002']
+      - targets: ['distilbert-service:8002']
 
   - job_name: 'iep3_identity_gateway'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['host.docker.internal:8080']
+      - targets: ['trust-call-backend:8080']

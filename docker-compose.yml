@@ -1,6 +1,49 @@
-version: '3.8'
-
 services:
+  rawnet-service:
+    build:
+      context: ./rawnet-service
+    container_name: trust_call_rawnet
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/metrics', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  distilbert-service:
+    build:
+      context: ./distilbert-service
+    container_name: trust_call_distilbert
+    ports:
+      - "8002:8002"
+    environment:
+      DISTILBERT_MODEL_NAME: ./custom_scam_model
+      DISTILBERT_USE_CLASSIFIER: "true"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/metrics', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  trust-call-backend:
+    build:
+      context: .
+      dockerfile: trust_call_backend/Dockerfile
+    container_name: trust_call_backend
+    ports:
+      - "8080:8080"
+    environment:
+      RAWNET_URL: http://rawnet-service:8000/predict
+      DISTILBERT_URL: http://distilbert-service:8002/predict
+      TRUST_CALL_SIGNAL_MIN_RMS: "0.0025"
+      TRUST_CALL_SIGNAL_MIN_PEAK: "0.02"
+      TRUST_CALL_SIGNAL_MIN_ACTIVE_RATIO: "0.015"
+      TRUST_CALL_SEMANTIC_CONTEXT_SECONDS: "8.0"
+    depends_on:
+      - rawnet-service
+      - distilbert-service
+
   prometheus:
     image: prom/prometheus:latest
     container_name: trust_call_prometheus
@@ -10,8 +53,10 @@ services:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-    extra_hosts:
-      - "host.docker.internal:host-gateway" # Crucial for Windows so Docker can see your Python FastAPIs!
+    depends_on:
+      - rawnet-service
+      - distilbert-service
+      - trust-call-backend
 
   grafana:
     image: grafana/grafana:latest

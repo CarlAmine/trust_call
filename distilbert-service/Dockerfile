@@ -4,7 +4,8 @@ WORKDIR /app
 
 # Install dependencies required for transformers and FastAPI
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --upgrade pip \
+    && pip install --no-cache-dir --default-timeout=120 --retries=5 -r requirements.txt
 
 # Copy the actual service code
 COPY . .
