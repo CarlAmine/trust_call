@@ -1,289 +1,234 @@
-# trust_call
-A real-time, multimodal AI defense system against voice fraud and social engineering.
+# Trust-Call
 
+Trust-Call is a real-time, multimodal AI defense system for VoIP-style calls. It analyzes live audio with three internal AI auditors and combines their outputs through a late-fusion decision engine.
 
+Current `dev` includes the full demo pipeline:
 
-## Engineering Progress: Phase 1 & 2 Complete (DATE: 03/10/2026, AUTHOR: GEORGE HABIB)
+- IEP1 Signal Auditor: RawNet2-based synthetic/deepfake voice detection.
+- IEP2 Semantic Auditor: Whisper transcription plus DistilBERT scam/coercion detection.
+- IEP3 Identity Auditor: ECAPA-TDNN speaker verification with TOFU enrollment.
+- EEP Gateway: WebRTC audio ingestion, parallel service orchestration, telemetry, and late fusion.
+- React Native Android app: simulated call flow, contact resolution, live telemetry display, and IEP3 voice-profile save/discard flow.
+- Monitoring: Prometheus and Grafana for RawNet, DistilBERT, and the IEP3/backend gateway.
 
-**Current Active Branch for AI Models:** `feature/rawnet-init`
-**Stable Gateway Code:** `dev`
+## Architecture
 
-We have successfully locked in the central API Gateway (EEP) and initialized the workspace for our first AI microservice. 
+```text
+React Native app
+  -> WebRTC audio offer to backend /offer
+  -> backend receives live microphone audio
+  -> 3-second overlapping audio chunks
+  -> IEP1 RawNet service on :8000
+  -> Whisper STT inside backend
+  -> IEP2 DistilBERT service on :8002
+  -> IEP3 ECAPA identity auditor inside backend
+  -> EEP late fusion
+  -> WebSocket + polling telemetry back to mobile
+```
 
-### 1. The API Gateway (EEP) - Fully Functional
-* **Framework:** Built using `FastAPI` and `uvicorn` (ASGI) for asynchronous, non-blocking performance.
-* **Input Validation:** Implemented a strict Pydantic `AudioPayload` data class to act as a shield. The EEP will instantly reject malformed payloads before they reach our internal AI models.
-* **Parallel Orchestration:** Integrated `httpx.AsyncClient` and `asyncio.gather()` to fire simultaneous, concurrent requests to the Internal Endpoints (IEPs) without freezing the server.
-* **Late Fusion Math:** The `/analyze` endpoint successfully calculates the final risk score using our custom Sigmoid formula: `Total_Risk = \sigma(W_1*Signal + W_2*Semantic + W_3*Identity)`. 
-* **Intervention Triggers:** Configured to return a `{"threat": "CRITICAL", "action": "DUCK_AUDIO"}` JSON response if the Fusion score exceeds `0.75`, unblocking the React Native team to start testing the UI haptics.
+The mobile app is currently a demo control surface. It simulates incoming calls inside the app; it does not intercept native Android phone calls.
 
-### 2. The Signal Auditor (RawNet2) - Initialized
-* **Workspace:** Created an isolated directory (`rawnet-service`) and a dedicated Python virtual environment to prevent dependency conflicts with the Gateway.
-* **Dependencies Locked:** Installed `fastapi`, `librosa`, and `soundfile` to handle the heavy audio-to-Mel-Spectrogram conversions. 
-* **Next Steps:** Write the Python logic to decode the Base64 audio string and feed the spectrogram matrix into the AI model.
+## Services And Ports
 
+| Component | Path | Port | Purpose |
+| --- | --- | --- | --- |
+| RawNet service | `rawnet-service` | `8000` | IEP1 signal/deepfake detection |
+| DistilBERT service | `distilbert-service` | `8002` | IEP2 semantic scam/coercion detection |
+| Backend gateway | `trust_call_backend` | `8080` | WebRTC, Whisper, IEP3, EEP fusion, telemetry |
+| Prometheus | `docker-compose.yml` | `9090` | Scrapes AI service metrics |
+| Grafana | `docker-compose.yml` | `3000` | Trust-Call dashboard |
+| React Native Metro | `TrustCallApp` | `8081` or selected Metro port | Mobile bundler |
 
-## Engineering Progress: IEP 1 (RawNet2) Preprocessing & Testing Complete (DATE: 03/11/2026, AUTHOR: GEORGE HABIB)
+## IEP1: Signal Auditor
 
-**Current Stable Branch:** `dev`
+The RawNet service loads the fine-tuned RawNet2 model at startup and exposes:
 
-We have successfully built and verified the audio ingestion pipeline for the Signal Auditor (RawNet2 microservice).
+- `POST /predict`: accepts Base64 WAV audio and returns spoof/real probabilities.
+- `GET /metrics`: FastAPI/Prometheus metrics.
 
-### IEP 1: Signal Auditor - Audio Pipeline
-* **Environment Setup:** Configured an isolated virtual environment for `rawnet-service` and locked required dependencies (`fastapi`, `librosa`, `soundfile`, `httpx`) in `requirements.txt` to prevent conflicts with the EEP Gateway.
-* [cite_start]**Endpoint Creation:** Built the `/predict` POST endpoint to catch the Base64 audio payloads forwarded by the API Gateway[cite: 123, 125].
-* **Privacy-First Decoding (Ephemeral RAM):** Implemented secure in-memory processing using `io.BytesIO`. The incoming Base64 audio string is decoded directly in the server's RAM. No voice data is ever written to the hard drive, maintaining strict privacy compliance.
-* [cite_start]**DSP Matrix Generation:** Integrated the `librosa` library to calculate the Mel-Spectrogram visual matrix from the decoded audio[cite: 126]. [cite_start]We successfully validated the matrix shape as `[128, 94]`, which is the exact format required to feed into the warm AI model[cite: 126].
-* [cite_start]**Local Integration Testing:** Created a standalone `test_client.py` script to simulate the mobile app's behavior[cite: 122]. The script successfully generated 3 seconds of raw audio [cite: 122], converted it to a Base64 text string[cite: 123], and verified that the microservice endpoint returns a `200 OK` status with the correct matrix dimensions without throwing errors.
+The backend sends each live audio chunk to this service asynchronously so the WebRTC stream is not blocked by model inference.
 
+## IEP2: Semantic Auditor
 
+The backend transcribes speech with Whisper, then sends text to the DistilBERT service.
 
-## Engineering Progress: IEP 1 (RawNet2) FastAPI Inference Complete (DATE: 19/3/2026, AUTHOR: GEORGE HABIB)
+The DistilBERT service exposes:
 
-**Current Stable Branch:** `dev`
+- `POST /predict`: accepts `scrubbed_text` and returns semantic risk, label, flagged phrases, and model name.
+- `GET /metrics`: FastAPI/Prometheus metrics.
 
-We have successfully migrated the RawNet2 PyTorch model into the production FastAPI microservice. The Signal Auditor is now fully online and capable of processing Base64 audio streams in real-time.
+Note: live semantic transcription requires `faster-whisper` in the backend Python environment. Without it, the backend still runs, but IEP2 live transcription will not produce real semantic telemetry.
 
-### IEP 1: Microservice Implementation
-* **Memory Management (Warm Start):** Implemented a FastAPI `@asynccontextmanager` lifespan event. The 150MB `pre_trained_DF_model.pth` file is loaded directly into the server's RAM upon startup, guaranteeing sub-500ms latency for all incoming requests.
-* **Audio Pipeline Bypass:** Successfully bypassed strict OS-level FFmpeg dependencies by integrating the `soundfile` C-library, ensuring raw bytes are decoded strictly in volatile memory.
-* **Dynamic Tensor Padding:** Wrote dynamic truncation and padding logic (`torch.nn.functional.pad`) to format variable-length human speech into the strict `[1, 64000]` 1D tensor required by the RawNet2 SincConv layer.
-* **End-to-End Validation:** The `test_client.py` successfully sends local `.wav` files as Base64 JSON payloads to the `/predict` endpoint, which accurately returns logarithmic softmax probabilities converted to readable percentages.
+## IEP3: Identity Auditor
 
-***🚨 CAPSTONE REQUIREMENT FLAG:** The microservice architecture is complete, but the current `pre_trained_DF_model.pth` uses baseline ASVspoof weights. This model MUST be fine-tuned on a custom dataset of telephonically-filtered AI voices before final submission.*
+IEP3 verifies whether the live speaker matches the expected contact. It is speaker verification, not broad speaker identification by default.
 
-## Engineering Progress: Cross-Microservice Integration Complete (DATE: 20/3/2026, AUTHOR: GEORGE HABIB)
+Implemented behavior:
 
-**Current Stable Branch:** `dev`
+- Resolves a caller/contact ID from the mobile app.
+- Extracts ECAPA-TDNN speaker embeddings from live audio chunks.
+- Compares the live embedding against the stored master vector using cosine similarity.
+- Uses configured thresholds from `configs/iep3_identity.json`.
+- Supports TOFU candidate collection when no profile exists.
+- After a call, the app can save or discard temporary TOFU embeddings.
+- Stores local backend speaker profiles under `trust_call_backend/state/identity_profiles`.
 
-Successfully established local network communication between the EEP API Gateway and the RawNet2 AI Microservice. The cloud architecture is now fully capable of end-to-end payload routing and centralized decision-making.
+Important privacy note for the current demo: profiles are local to the Python backend machine, not yet encrypted on the phone. The final product should move identity vectors to secure on-device storage or a production-grade encrypted profile store.
 
-### IEP 2: Gateway Routing & Business Logic
-* **Asynchronous Networking:** Upgraded the EEP Gateway (`eep-gateway/main.py`) with `httpx.AsyncClient`. It now successfully intercepts Base64 audio payloads from the mobile client and securely forwards them to the isolated AI Microservice (`http://localhost:8000/predict`).
-* **Centralized Cloud Logic:** Shifted the core business logic from the mobile client to the cloud. The Gateway evaluates raw AI telemetry to generate an actionable system directive (`BLOCK` or `ALLOW`) based on a >50% spoof probability threshold.
-* **Hybrid JSON Responses:** Structured the API to return a dual-payload containing both the strict system directive (for device execution) and the raw AI percentages (for UI rendering).
-* **End-to-End Validation:** Verified the complete pipeline using a local Python client. Real audio is correctly processed through the Gateway to the AI brain and back, returning a 99.96% `SAFE` classification.
+Useful IEP3 endpoints:
 
+- `GET /identity/config`
+- `GET /identity/enrollment/{caller_id}`
+- `POST /identity/enroll`
+- `POST /identity/verify`
+- `POST /identity/identify`
+- `POST /identity/live/validate`
+- `GET /identity/live/sessions`
+- `GET /identity/live/sessions/{session_id}`
+- `POST /identity/live/sessions/{session_id}/enroll-candidate`
+- `DELETE /identity/live/sessions/{session_id}/candidate`
 
-## 📱 Mobile App Setup (Android) (DATE: 22/3/2026, AUTHOR: GEORGE HABIB)
+## EEP Late Fusion
 
-Welcome to the Trust-Call React Native app! Native Android development on Windows requires strict environment configurations. **Please read this carefully before running the app.**
+The backend combines IEP1, IEP2, and IEP3 results into a final call status.
 
-### ⚠️ Crucial Windows Prerequisites
-If you are developing on Windows, you **MUST** do these two things before building, or the C++ compiler will crash:
-1. **Move out of OneDrive:** Do not clone this repo into a OneDrive or deeply nested folder. Clone it directly to a root drive (e.g., `C:\trust_call` or `E:\trust_call`).
-2. **Enable Windows Long Paths:** The WebRTC and TFLite C++ libraries exceed standard Windows file path limits. Open an Administrator PowerShell and run:
-   `New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force`
+Current fusion behavior:
 
-### 🛠️ Required Android Studio Tools
-Open Android Studio -> SDK Manager -> SDK Tools (Check "Show Package Details" at the bottom right) and ensure you have these installed:
-* **NDK (Side by side):** Version `27.1.12297006`
-* **CMake:** Version `3.22.1`
+- Synthetic signal or semantic threat can trigger a threat state.
+- Identity mismatch alone creates review/caution states rather than immediately blocking.
+- Identity mismatch combined with signal or semantic risk becomes stronger evidence.
+- TOFU enrollment is treated as learning mode until the user confirms saving a voice profile.
 
-### 🚀 Running the App
-1. Open your Android Virtual Device (AVD) in Android Studio and ensure it is powered on.
-2. Install dependencies:
-   ```bash
-    npm install
+The mobile app displays this as `Late Fusion Status`.
 
-3. Start the Metro Bundler (in terminal 1):
-    ```Bash
-    npm start
+## Mobile App Behavior
 
-4. Build the Android app (in terminal 2):
-    ```Bash
-    npx react-native run-android
+The Android app currently supports:
 
+- Loading real Android contacts when `READ_CONTACTS` is granted.
+- Falling back to demo contacts when contacts are unavailable.
+- Normalizing phone numbers into stable caller IDs.
+- Simulating incoming calls by entered phone number.
+- Simulating selected-contact and unknown-caller calls.
+- Requesting microphone permission.
+- Sending microphone audio to the backend through WebRTC.
+- Displaying live Signal, Semantic, Identity, confidence, candidate, chunk, frame, buffer, TOFU, reason, and fusion telemetry.
+- Saving or discarding TOFU voice profiles after a call.
 
+For a physical Android phone connected by USB, keep the backend host override as `127.0.0.1` and run:
 
-## Engineering Progress:  (DATE: 31/3/2026, AUTHOR: GEORGE HABIB)
-📱 React Native Frontend
-WebRTC Integration: Successfully implemented react-native-webrtc to handle real-time audio streams.
+```powershell
+adb reverse tcp:8080 tcp:8080
+```
 
-Native Security: Engineered a robust Android permissions flow to safely request and handle hardware access (Microphone/Camera) without triggering OS-level crashes.
+For a LAN/Wi-Fi phone test without `adb reverse`, update `TrustCallApp/src/config/backend.ts` so `MANUAL_BACKEND_HOST_OVERRIDE` points to the laptop IP address.
 
-Signaling Pipeline: Built an SDP Offer generation system in CallScreen.tsx that successfully transmits WebRTC handshakes to the local Python server via the Android emulator's network bridge.
+## Monitoring
 
-UI/UX: Constructed the foundational CallScreen interface to display live AI telemetry metrics and late-fusion decision status.
+Prometheus and Grafana are configured through Docker Compose.
 
-🧠 Python AI Backend
-Environment Setup: Initialized an isolated Python virtual environment utilizing FastAPI and aiortc for real-time media handling.
+Prometheus scrapes:
 
-API Architecture: Created a local server endpoint (/offer) equipped with CORS middleware to catch and negotiate WebRTC handshakes from the mobile app.
+- `rawnet_audio_ai` at `host.docker.internal:8000/metrics`
+- `distilbert_semantic_ai` at `host.docker.internal:8002/metrics`
+- `iep3_identity_gateway` at `host.docker.internal:8080/metrics`
 
-Real-Time Audio Buffer Engine: Engineered an asynchronous background worker that successfully consumes live 20ms audio frames, extracts the sample rate, and efficiently batches them into precise 3-second numpy arrays entirely in RAM, preparing them for downstream ML processing (RawNet2/ECAPA).
+Grafana is provisioned automatically with:
 
+- Prometheus datasource.
+- `Trust-Call AI Services` dashboard.
+- Panels for service health, backend audio chunk rate, IEP3 identity decisions, enrolled profiles, and EEP fusion outcomes.
 
+Start monitoring:
 
+```powershell
+cd C:\Users\JL\Desktop\trust_call
+docker compose up
+```
 
+Open:
 
-## Session Log: AI Fine-Tuning & Microservice Bridge (DATE: 1/4/2026, AUTHOR: GEORGE HABIB)
+- Prometheus: `http://localhost:9090`
+- Grafana: `http://localhost:3000`
 
-### 🧠 1. RawNet2 Transfer Learning (Domain Adaptation)
-* **The Data Strategy:** Bypassed outdated datasets (ASVspoof 2021) to focus on modern TTS engines (ElevenLabs, Hume AI, etc.). Built `download_data.py` to stream the `garystafford/deepfake-audio-detection` dataset directly from Hugging Face.
-* **FFmpeg Bypass:** Engineered a solution to bypass Windows FFmpeg C++ dependency crashes by directly casting Hugging Face audio to raw bytes and writing them to disk using standard file I/O.
-* **The Training Pipeline:** Wrote `train_transfer.py` to perform transfer learning on our pre-trained RawNet2 weights. 
-  * **Frozen Layers:** Sinc_conv filters and Residual Blocks 0-5.
-  * **Unfrozen Layers:** GRU and Fully Connected classification layers.
-* **Results:** Fine-tuned the model on 1,000 files (500 Real / 500 Fake) for 20 epochs, achieving **96.7% training accuracy**.
-* **Zero-Shot Validation:** Successfully tested the new `fine_tuned_DF_model.pth` against a blind ElevenLabs deepfake via the `test_client.py` API, returning a **99.95% Spoof Probability**. 
+## Running The Local Demo
 
-### 🌉 2. WebRTC to AI Bridge (The Microservice Link)
-* Connected the `trust_call_backend` (WebRTC) to the `rawnet-service` (AI FastAPI).
-* Upgraded the 3-second buffer engine in `server.py`:
-  * Concatenates live 20ms PyAV frames into a single `numpy` array.
-  * Fixes sample rate distortion by dynamically catching the native WebRTC mic sample rate (usually 48kHz) and converting it to a WAV file in memory (`io.BytesIO`).
-  * Utilizes `asyncio` and `httpx.AsyncClient` to POST the Base64 audio payload to the AI server in the background, ensuring the live phone call never drops packets or blocks the thread.
+Use separate terminals.
 
-### 📁 3. Version Control & Hygiene
-* Updated `.gitignore` in the AI directory to block massive binary files (`*.pth`), `hf_cache/`, and local `training_data/` from bloating the GitHub repository.
-* Safely merged the upgraded `rawnet-service` to the `dev` branch.
+### Terminal 1: RawNet
 
+```powershell
+cd C:\Users\JL\Desktop\trust_call\rawnet-service
+python -m uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
+### Terminal 2: DistilBERT
 
-# 🚀 Progress Update: Real-Time AI Telemetry Integration (DATE: 3/4/2026, AUTHOR: GEORGE HABIB)
+```powershell
+cd C:\Users\JL\Desktop\trust_call\distilbert-service
+python -m uvicorn main:app --host 0.0.0.0 --port 8002
+```
 
-## 1. Real-Time Telemetry Bridge (FastAPI & WebSockets)
+### Terminal 3: Backend Gateway
 
-Established a parallel WebSocket connection alongside the existing WebRTC audio pipeline to enable bidirectional, real-time communication.
+```powershell
+cd C:\Users\JL\Desktop\trust_call
+python -m uvicorn trust_call_backend.server:app --host 0.0.0.0 --port 8080
+```
 
-Implemented a `ConnectionManager` in the FastAPI gateway to manage active mobile client sockets and broadcast JSON payloads.
+### Terminal 4: Monitoring
 
-Configured the backend to instantly push `RawNet2` biometric predictions down to the mobile device the moment a 3-second audio chunk is processed, achieving near-zero latency for UI updates.
+```powershell
+cd C:\Users\JL\Desktop\trust_call
+docker compose up
+```
 
-## 2. Dynamic UI & Threat Visualization (React Native)
+### Terminal 5: Android App
 
-Upgraded the `CallScreen` component to actively listen to the WebSocket stream and parse incoming telemetry data.
+```powershell
+cd C:\Users\JL\Desktop\trust_call\TrustCallApp
+adb reverse tcp:8080 tcp:8080
+npx react-native run-android
+```
 
-Mapped the JSON payload to React Native state variables, allowing the "Live AI Telemetry" board to update continuously without refreshing the screen.
+If multiple Android devices are connected:
 
-Implemented a dynamic threat-formatting engine: the backend now evaluates the spoof probability against a `>50%` threshold and sends an `is_threat` flag. The mobile UI dynamically formats the text ("Human" vs. "AI (Deepfake)") and swaps typography colors (Green for safe, Red for threat) based on this flag.
+```powershell
+adb devices
+npx react-native run-android --device <device_id>
+```
 
-## 3. Call Lifecycle & State Management
+## Expected Demo Flow
 
-Replaced automatic background audio streaming with an explicit `isCallActive` state machine.
+1. Open the app.
+2. Confirm the backend status shows online.
+3. Enter or select a caller/contact.
+4. Start a simulated call.
+5. Press `Accept`.
+6. Speak for at least 10-20 seconds.
+7. Watch Signal, Semantic, Identity, and Late Fusion telemetry update.
+8. If the caller is not enrolled, end the call and choose whether to save the collected TOFU voice profile.
+9. Repeat the call for that contact and check whether IEP3 moves from TOFU collection to verification.
+10. Open Grafana and confirm the IEP3/backend panels update while calls run.
 
-Implemented an "Accept Call" UI flow, ensuring that microphone permissions, WebRTC handshakes, WebSocket connections, and the call duration timer only initialize when the user explicitly interacts with the call prompt.
+## Evaluation Tools
 
-## 4. Raw Audio Capture Optimization
+IEP3 evaluation scripts are available under `scripts/`:
 
-Configured advanced `mediaDevices.getUserMedia` constraints to intentionally disable Android's native audio preprocessing (Echo Cancellation, Noise Suppression, and Auto Gain Control).
+- `scripts/evaluate_iep3.py`
+- `scripts/plot_iep3_metrics.py`
 
-This ensures the `RawNet2` neural network receives pure, uncompressed, and unaltered acoustic data, drastically improving the model's ability to detect synthetic audio signatures and presentation attacks.
+Dataset instructions live in:
 
+- `data/evaluation/iep3/README.md`
 
+The evaluator generates trial scores, summary metrics, and threshold recommendations. The current production threshold policy is stored in `configs/iep3_identity.json`.
 
+## Current Limitations
 
-# 🛡️ Phase 2: Semantic Intent & Late Fusion Integration (DATE: 6/4/2026, AUTHOR: GEORGE HABIB)
-
-> **Multi-Modal Threat Detection | Parallel Microservices | Context-Aware AI Auditing**
-
-## 📖 Overview
-Phase 2 evolves the system from a single-threaded pipeline into a **Parallel Fan-Out Architecture**. The core `server.py` now acts as an intelligent API Gateway ("The Brain"), orchestrating concurrent AI microservices to analyze both the acoustic properties and semantic intent of incoming voice streams in real-time.
-
-## 🏗️ System Architecture
-
-### 🧠 Orchestrated API Gateway
-The gateway manages concurrent inference across three specialized microservices:
-- **🔊 Acoustic Auditor (`RawNet2`):** Detects synthetic voice artifacts and deepfake signatures by analyzing raw audio waveforms.
-- **📝 Semantic Auditor (`DistilBERT`):** Evaluates transcribed text for manipulative language, phishing intent, and social engineering patterns.
-- **🎙️ Whisper STT Engine:** Performs low-latency, on-device transcription of the encrypted WebRTC audio stream.
-
-## 🧠 Contextual Memory: The 21-Second Buffer
-To eliminate false positives from isolated keywords, the system implements a **Rolling Context Buffer**:
-- Audio is processed in `3-second chunks`
-- Maintains a sliding window of the `last 7 chunks` (~21 seconds of conversation)
-- Enables cross-sentence intent recognition (e.g., linking *"I'm calling from your bank"* at `t=5s` with *"Please verify your OTP"* at `t=18s`)
-
-## ⚖️ Late Fusion Decision Logic
-Instead of relying on a single modality, the gateway employs a custom **Late Fusion Layer** that mathematically combines acoustic and semantic confidence scores:
-
-$$ \text{Threat} = (P_{\text{acoustic}} > 0.5) \lor (P_{\text{semantic}} > 0.6) $$
-
-**Why this works:**
-- 🛡️ **Acoustic bypass:** If a deepfake is acoustically perfect (`P_acoustic < 0.5`), the semantic model can still trigger an alert.
-- 🗣️ **Contextual bypass:** If malicious intent is disguised in natural speech, the acoustic analyzer catches synthetic artifacts.
-- ⚡ **Low latency:** Parallel inference + weighted OR logic ensures real-time decisioning without blocking the WebRTC stream.
-
-## 🤖 Neural Semantic Fine-Tuning Pipeline *(In Progress)*
-Moving beyond keyword matching, we're fine-tuning `DistilBERT` on a domain-specific dataset:
-
-### 📊 Data Generation & Curation
-- **Synthetic Vishing Corpus:** LLM-generated transcripts covering modern attack vectors (crypto scams, AI voice cloning, OTP fraud)
-- **Public Dataset Integration:** Merged with UC Irvine SMS Spam Corpus
-- **Final Matrix:** ~2,500 balanced samples (`50/50` class distribution)
-
-### 🏷️ Class Distribution
-| Class | Label | Description |
-|-------|-------|-------------|
-| `0` | ✅ Safe | Everyday conversations & benign SMS |
-| `1` | ⚠️ Scam | Modern vishing scripts & malicious phishing texts |
-
-## 🚀 Next Steps
-- [ ] Complete DistilBERT fine-tuning & validation
-- [ ] Optimize chunk overlap & buffer windowing
-- [ ] Implement dynamic threshold adjustment based on user feedback
-- [ ] Add confidence scoring telemetry to the WebSocket stream
-
----
-*Built for real-time, multi-modal threat detection. Phase 2 transforms reactive filtering into proactive, context-aware AI auditing.*
-
-
-
-
-# 🧠 Phase 3: Neural Semantic Fine-Tuning & Integration (DATE: 9/4/2026, AUTHOR: GEORGE HABIB)
-
-- Objective: Upgrade the Semantic Auditor from a basic Regex keyword-matcher to a deep learning text classifier capable of understanding manipulative intent and context.
-
-- Custom Model Fine-Tuning: Engineered a PyTorch training loop (train_model.py) using the Hugging Face Trainer API. We fine-tuned the distilbert-base-uncased model on a perfectly balanced, 2,500-row dataset of modern vishing transcripts and safe human conversations.
-
-- Anti-Overfitting Measures: Trained the model for 3 epochs with a load_best_model_at_end callback, automatically discarding overfitted epochs and securing a peak validation accuracy and F1 score of 99.0%.
-
-- Empirical QA Benchmarking: Developed a rigorous test suite (qa_model_comparison.py) pitting the legacy heuristic model against the new neural network using tricky edge cases (e.g., safe texts with "scary" keywords, or keyword-less emotional distress scams). The fine-tuned model demonstrated a 2x accuracy improvement (66.7% vs 33.3%) over the baseline.
-
-- Microservice Brain Transplant: Successfully migrated the ~260MB local model weights (.safetensors) directly into the distilbert-service directory, updating .gitignore protocols to safely bypass GitHub's 100MB file limits.
-
-- API Activation: Updated the main.py entry point to load the local custom model and flipped the USE_CLASSIFIER flag to True, officially switching the WebRTC pipeline's semantic analysis to the live neural network.
-
-
-
-
-
-#  MLOps & Telemetry Infrastructure Update (Phase Completion) (Date: 30/4/2026, author: George Habib)
-1. Audio Deepfake Model Evaluation (RawNet2)
-
-Finalized the evaluate_rawnet.py script to automatically run comparative testing between the ASVspoof Baseline and the Fine-Tuned Custom model.
-
-Bug Fixes:
-
-Resolved a PyTorch tensor dimension bug by correcting the unsqueeze() logic for single-file audio inference.
-
-Fixed an architecture mutation bug where the d_args dictionary was being passed by reference and altered, allowing multiple models to load sequentially in the same script without state dictionary mismatches.
-
-Stability: Implemented soundfile for audio loading to permanently bypass Windows FFmpeg crash issues during inference.
-
-2. MLflow Centralization & Version Control
-
-Centralized Database: Migrated away from fragmented, microservice-level MLflow tracking. Established a single, unified SQLite master database (mlflow.db) at the project root (E:\trust_call).
-
-Updated all training and evaluation scripts (train.py, train_transfer.py, evaluate_models.py, evaluate_rawnet.py) to route their metrics to the absolute URI of the central hub.
-
-Git Safety Lock: Added strict .gitignore rules to prevent massive AI weights (*.pth, *.pt) and binary database files (mlflow.db, mlruns/) from bloating the GitHub repository and causing merge conflicts.
-
-3. Enterprise Monitoring Stack (Prometheus & Grafana)
-
-Infrastructure as Code: Built a docker-compose.yml engine at the project root to spin up Prometheus and Grafana simultaneously.
-
-FastAPI Instrumentation: Injected prometheus-fastapi-instrumentator into both the rawnet-service and distilbert-service to automatically generate real-time /metrics endpoints.
-
-WSL/Windows Network Bridging: Successfully configured prometheus.yml to bridge the gap between Docker containers running in Ubuntu (WSL) and the native FastAPI Python servers running on Windows using explicit IPv4 routing.
-
-Grafana Dashboard Integration:
-
-Connected Grafana to the Prometheus data source.
-
-Wrote custom PromQL queries (sum(rate(http_requests_total{handler!="/metrics"}[1m])) by (job)) to track live HTTP traffic hitting the AI models while automatically filtering out background telemetry noise.
-
-Fixed port routing (8002) in the test_client.py script to accurately simulate traffic.
-
-Exported the resulting real-time "AI Model Traffic" dashboard as a .json file and saved it to the monitoring/ folder for team-wide version control and easy importing.
+- The app simulates calls inside Trust-Call; it does not hook into Android's native dialer.
+- AI models run through local/backend services, not fully on-device.
+- IEP3 profile vectors are stored in the backend local state directory for the demo.
+- Live IEP2 requires `faster-whisper` to be installed in the backend environment.
+- `start_services.ps1` may need path cleanup before it is reliable across machines.
+- Production deployment still needs real auth, encrypted profile storage, secret management, hosted service configuration, CI/CD, and monitoring hardening.
