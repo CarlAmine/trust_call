@@ -38,6 +38,11 @@ from trust_call_backend.schemas import (
 from trust_call_backend.service_clients import fetch_distilbert_prediction, fetch_rawnet_prediction
 
 try:
+    from trust_call_backend.fusion import build_fusion_status
+except ModuleNotFoundError:
+    from fusion import build_fusion_status  # type: ignore
+
+try:
     from faster_whisper import WhisperModel
 except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
     WhisperModel = None  # type: ignore[assignment]
@@ -97,6 +102,49 @@ app.add_middleware(
 
 
 metrics = MetricsRegistry()
+
+
+class Offer(BaseModel):
+    sdp: str = Field(..., min_length=1, max_length=200_000)
+    type: str = Field(..., min_length=1, max_length=32)
+    caller_id: str = Field(default="unknown", max_length=128)
+
+
+class IdentityEnrollmentPayload(BaseModel):
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+    allow_update: bool = False
+    ema_alpha: float | None = None
+    safe_to_enroll: bool = False
+    safe_to_update: bool = False
+    synthetic_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    coercion_score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
+class IdentityVerificationPayload(BaseModel):
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+
+
+class IdentityIdentificationPayload(BaseModel):
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+    claimed_caller_id: str = Field(default="unknown", max_length=128)
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+class LiveIdentityValidationPayload(BaseModel):
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+    session_id: str | None = Field(default=None, max_length=128)
+    dispatch_signal_auditor: bool = False
+    identify_if_unenrolled: bool = False
+    top_k: int = Field(default=3, ge=1, le=10)
+
+
+class LiveSessionEnrollmentPayload(BaseModel):
+    safe_to_enroll: bool = True
+    synthetic_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    coercion_score: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ConnectionManager:
@@ -639,6 +687,42 @@ async def delete_identity_enrollment(caller_id: str):
         "caller_id": caller_id,
         "deleted": True,
     }
+
+
+async def fetch_rawnet(base64_audio: str) -> float:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                RAWNET_URL,
+                json={"base64_audio": base64_audio},
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                return float(data.get("spoof_probability_percent", 0.0))
+            print(f"RawNet service error: {response.status_code} {response.text}")
+    except Exception as exc:
+        print(f"RawNet service unavailable: {exc}")
+    return 0.0
+
+
+async def fetch_distilbert(text: str) -> dict:
+    if not text.strip():
+        return {"semantic_score": 0.0, "label": "insufficient_text"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                DISTILBERT_URL,
+                json={"scrubbed_text": text},
+                timeout=5.0,
+            )
+            if response.status_code == 200:
+                return response.json()
+            print(f"DistilBERT service error: {response.status_code} {response.text}")
+    except Exception as exc:
+        print(f"DistilBERT service unavailable: {exc}")
+    return {"semantic_score": 0.0, "label": "semantic_unavailable"}
 
 
 async def orchestrate_late_fusion(

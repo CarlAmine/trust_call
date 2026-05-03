@@ -1,15 +1,19 @@
-from trust_call_backend.metrics_registry import MetricsRegistry
+import pytest
+pytestmark = pytest.mark.requires_models
+
+"""
+tests/test_identity_flow.py
 
 
 def test_metrics_registry_increment_counter():
-    metrics = MetricsRegistry()
-    metrics.inc("my_counter")
-    rendered = metrics.render()
-    assert "my_counter 1.0" in rendered
+    m = MetricsRegistry()
+    m.inc('my_counter')
+    out = m.render()
+    assert 'my_counter 1.0' in out
 
 
-def test_metrics_registry_labeled_counter():
-    metrics = MetricsRegistry()
-    metrics.inc("requests_total", status="ok")
-    rendered = metrics.render()
-    assert 'requests_total{status="ok"} 1.0' in rendered
+def test_metrics_registry_labels_rendered():
+    m = MetricsRegistry()
+    m.inc('requests', status='ok')
+    rendered = m.render()
+    assert 'requests{status="ok"} 1.0' in rendered

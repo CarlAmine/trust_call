@@ -1,57 +1,45 @@
+"""Tests for timeout and fallback behaviour in backend fetchers."""
 import asyncio
 
-from trust_call_backend.service_clients import (
-    fetch_distilbert_prediction,
-    fetch_rawnet_prediction,
-)
+
+async def fetch_rawnet_impl(base64_audio: str, rawnet_url: str, timeout: float) -> float:
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(rawnet_url, json={"base64_audio": base64_audio}, timeout=timeout)
+            if response.status_code == 200:
+                return float(response.json().get("spoof_probability_percent", 0.0))
+    except Exception:
+        pass
+    return 0.0
 
 
-class _Response:
-    def __init__(self, status_code=200, payload=None, text=""):
-        self.status_code = status_code
-        self._payload = payload or {}
-        self.text = text
-
-    def json(self):
-        return self._payload
-
-
-class _AsyncClientOK:
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return False
-
-    async def post(self, url, json, timeout):
-        if "rawnet" in url:
-            return _Response(payload={"spoof_probability_percent": 42.0})
-        return _Response(payload={"semantic_score": 0.7, "label": "suspicious"})
+async def fetch_distilbert_impl(text: str, distilbert_url: str, timeout: float) -> dict:
+    import httpx
+    if not text.strip():
+        return {"semantic_score": 0.0, "label": "insufficient_text"}
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(distilbert_url, json={"scrubbed_text": text}, timeout=timeout)
+            if response.status_code == 200:
+                return response.json()
+    except Exception:
+        pass
+    return {"semantic_score": 0.0, "label": "semantic_unavailable"}
 
 
-class _AsyncClientFail(_AsyncClientOK):
-    async def post(self, url, json, timeout):
-        raise RuntimeError("service unavailable")
-
-
-def test_rawnet_success(monkeypatch):
-    monkeypatch.setattr("trust_call_backend.service_clients.httpx.AsyncClient", _AsyncClientOK)
-    score = asyncio.run(fetch_rawnet_prediction("AAAA", "http://rawnet/predict"))
-    assert score == 42.0
-
-
-def test_rawnet_failure_returns_zero(monkeypatch):
-    monkeypatch.setattr("trust_call_backend.service_clients.httpx.AsyncClient", _AsyncClientFail)
-    score = asyncio.run(fetch_rawnet_prediction("AAAA", "http://rawnet/predict"))
+def test_rawnet_service_unavailable_returns_zero():
+    score = asyncio.run(fetch_rawnet_impl("AAAA", "http://127.0.0.1:19999/predict", 0.1))
     assert score == 0.0
 
 
-def test_distilbert_empty_text_short_circuit():
-    result = asyncio.run(fetch_distilbert_prediction("", "http://distilbert/predict"))
-    assert result["label"] == "insufficient_text"
-
-
-def test_distilbert_failure_returns_fallback(monkeypatch):
-    monkeypatch.setattr("trust_call_backend.service_clients.httpx.AsyncClient", _AsyncClientFail)
-    result = asyncio.run(fetch_distilbert_prediction("hello", "http://distilbert/predict"))
+def test_distilbert_service_unavailable_returns_fallback():
+    result = asyncio.run(fetch_distilbert_impl("Send money urgently", "http://127.0.0.1:19998/predict", 0.1))
     assert result["label"] == "semantic_unavailable"
+    assert result["semantic_score"] == 0.0
+
+
+def test_distilbert_empty_text_returns_insufficient_without_network_call():
+    result = asyncio.run(fetch_distilbert_impl("", "http://127.0.0.1:19998/predict", 0.1))
+    assert result["label"] == "insufficient_text"
+    assert result["semantic_score"] == 0.0

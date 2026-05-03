@@ -10,38 +10,38 @@ from trust_call_backend.schemas import (
 
 
 def test_valid_offer_passes():
-    offer = Offer(sdp="v=0", type="offer")
-    assert offer.type == "offer"
+    o = Offer(sdp='v=0', type='offer')
+    assert o.type == 'offer'
 
 
 def test_empty_sdp_fails():
     with pytest.raises(ValidationError):
-        Offer(sdp="", type="offer")
+        Offer(sdp='', type='offer')
 
 
-def test_sdp_over_limit_fails():
+def test_sdp_too_long_fails():
     with pytest.raises(ValidationError):
-        Offer(sdp="x" * 200_001, type="offer")
+        Offer(sdp='x' * 200001, type='offer')
 
 
-def test_base64_audio_over_limit_fails():
+def test_base64_audio_too_long_fails():
     with pytest.raises(ValidationError):
-        IdentityEnrollmentPayload(caller_id="abc", base64_audio="a" * 12_000_001)
+        IdentityEnrollmentPayload(caller_id='c', base64_audio='a' * 12000001)
 
 
-def test_caller_id_over_limit_fails():
+def test_caller_id_too_long_fails():
     with pytest.raises(ValidationError):
-        IdentityEnrollmentPayload(caller_id="c" * 129, base64_audio="abc")
+        IdentityEnrollmentPayload(caller_id='c' * 129, base64_audio='abc')
 
 
-def test_top_k_bounds_fail_outside_range():
+def test_top_k_bounds():
     with pytest.raises(ValidationError):
-        IdentityIdentificationPayload(base64_audio="abc", top_k=0)
+        IdentityIdentificationPayload(base64_audio='abc', top_k=0)
     with pytest.raises(ValidationError):
-        IdentityIdentificationPayload(base64_audio="abc", top_k=11)
+        IdentityIdentificationPayload(base64_audio='abc', top_k=11)
 
 
-def test_score_bounds_fail_outside_range():
+def test_score_bounds():
     with pytest.raises(ValidationError):
         LiveSessionEnrollmentPayload(synthetic_score=-0.1)
     with pytest.raises(ValidationError):

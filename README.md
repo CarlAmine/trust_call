@@ -1,8 +1,5 @@
 # Trust-Call
 
-![Tests](https://github.com/CarlAmine/trust_call/actions/workflows/test.yml/badge.svg?branch=dev)
-![Docker Build Validation](https://github.com/CarlAmine/trust_call/actions/workflows/docker-build.yml/badge.svg?branch=dev)
-
 ## For Grading
 
 The main grading map is:
@@ -21,8 +18,6 @@ CI and QA evidence:
 - `tests/`
 
 `readme_correction.md` maps every rubric component to the exact file, test, deployment config, or monitoring artifact where it can be verified.
-
-Final submission checklist: `docs/final_submission_checklist.md`.
 
 Trust-Call is a real-time, multimodal AI defense system for VoIP-style calls. It analyzes live audio with three internal AI auditors and combines their outputs through a late-fusion decision engine.
 
