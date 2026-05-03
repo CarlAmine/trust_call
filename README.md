@@ -194,6 +194,66 @@ Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/docs
 Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/metrics
 ```
 
+## Friend Cloud Demo Quickstart
+
+Use this path when testing the deployed demo without local Python models.
+
+What your tester needs:
+
+- Latest `dev` branch.
+- Node/npm installed.
+- Android Studio / Android SDK installed.
+- A running Android emulator or USB-connected Android phone with USB debugging enabled.
+- Internet access.
+
+What your tester does not need:
+
+- No local Python backend.
+- No local RawNet model.
+- No local DistilBERT model.
+- No local ECAPA/IEP3 model cache.
+- No `adb reverse tcp:8080 tcp:8080`.
+
+The mobile app already points to the deployed public EEP:
+
+```text
+https://trust-call-backend-uccxv72y5a-ew.a.run.app
+```
+
+Run the app:
+
+```powershell
+git checkout dev
+git pull origin dev
+cd TrustCallApp
+npm install
+npx react-native run-android
+```
+
+If using a specific physical device:
+
+```powershell
+adb devices
+npx react-native run-android --device <device_id>
+```
+
+Expected result:
+
+1. The app opens on Android.
+2. Select or simulate a caller.
+3. Press `Accept`.
+4. Allow microphone permission.
+5. Speak for 10-20 seconds.
+6. The app should show Signal, Semantic, Identity, and Late Fusion telemetry.
+
+If the app cannot connect, first verify the public backend opens:
+
+```text
+https://trust-call-backend-uccxv72y5a-ew.a.run.app/docs
+```
+
+Demo limitation: in this deployed demo, IEP3 runs in the hosted backend so testers do not need the ECAPA model locally. The intended production privacy direction is to move IEP3 embeddings/model execution to secure on-device storage.
+
 ## Running The Local Demo
 
 Use separate terminals.
