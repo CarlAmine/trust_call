@@ -9,10 +9,16 @@ from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 
+# Keep model downloads inside the project instead of the Windows user cache,
+# which can be locked down on some machines.
+PROJECT_STATE_ROOT = Path(__file__).resolve().parent / "state"
+os.environ.setdefault("HF_HOME", str(PROJECT_STATE_ROOT / "huggingface"))
+os.environ.setdefault("HF_HUB_CACHE", str(PROJECT_STATE_ROOT / "huggingface" / "hub"))
+
 import httpx
 import numpy as np
 import soundfile as sf
-from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -46,9 +52,16 @@ except ModuleNotFoundError:
 
 RAWNET_URL = os.getenv("RAWNET_URL", "http://127.0.0.1:8000/predict")
 DISTILBERT_URL = os.getenv("DISTILBERT_URL", "http://127.0.0.1:8002/predict")
+WEBRTC_STUN_URL = os.getenv("TRUST_CALL_WEBRTC_STUN_URL", "stun:stun.l.google.com:19302")
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "tiny.en")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+SIGNAL_MIN_RMS = float(os.getenv("TRUST_CALL_SIGNAL_MIN_RMS", "0.0025"))
+SIGNAL_MIN_PEAK = float(os.getenv("TRUST_CALL_SIGNAL_MIN_PEAK", "0.02"))
+SIGNAL_MIN_ACTIVE_RATIO = float(os.getenv("TRUST_CALL_SIGNAL_MIN_ACTIVE_RATIO", "0.015"))
+SEMANTIC_MIN_CONTEXT_SECONDS = float(os.getenv("TRUST_CALL_SEMANTIC_CONTEXT_SECONDS", "8.0"))
+SEMANTIC_MAX_CONTEXT_SECONDS = float(os.getenv("TRUST_CALL_SEMANTIC_MAX_CONTEXT_SECONDS", "12.0"))
+SEMANTIC_MIN_CHARS = int(os.getenv("TRUST_CALL_SEMANTIC_MIN_CHARS", "20"))
 
 app = FastAPI(title="Trust-Call WebRTC Gateway", version="1.0")
 
@@ -477,7 +490,7 @@ def _load_whisper_model():
 manager = ConnectionManager()
 live_identity_monitor = LiveIdentityMonitor()
 peer_connections: set[RTCPeerConnection] = set()
-state_root = Path(__file__).resolve().parent / "state"
+state_root = PROJECT_STATE_ROOT
 identity_config = load_identity_auditor_config()
 identity_store = IdentityEnrollmentStore(state_root / "identity_profiles")
 identity_auditor = IdentityAuditor(
@@ -778,22 +791,33 @@ async def orchestrate_late_fusion(
     text_context: str,
     identity_result: IdentityResult,
     session_id: str,
+    signal_quality: dict | None = None,
+    semantic_context_seconds: float = 0.0,
 ) -> None:
-    rawnet_task = fetch_rawnet(base64_audio)
-    distilbert_task = fetch_distilbert(text_context)
-    synthetic_score, distilbert_data = await asyncio.gather(
-        rawnet_task,
-        distilbert_task,
+    signal_quality = signal_quality or {"usable": True, "reason": "not_measured"}
+    rawnet_task = (
+        fetch_rawnet(base64_audio)
+        if signal_quality.get("usable", True)
+        else _immediate_float(0.0)
     )
+    distilbert_task = (
+        fetch_distilbert(text_context)
+        if _semantic_context_ready(text_context, semantic_context_seconds)
+        else _immediate_dict(_semantic_waiting_result(text_context, semantic_context_seconds))
+    )
+    synthetic_score, distilbert_data = await asyncio.gather(rawnet_task, distilbert_task)
 
     semantic_score = float(distilbert_data.get("semantic_score", 0.0))
     semantic_label = str(distilbert_data.get("label", "benign"))
     real_score = max(0.0, 100.0 - synthetic_score)
-    signal_score = (
-        f"{synthetic_score:.2f}% AI (Deepfake)"
-        if synthetic_score > 50.0
-        else f"{real_score:.2f}% Human"
-    )
+    if signal_quality.get("usable", True):
+        signal_score = (
+            f"{synthetic_score:.2f}% AI (Deepfake)"
+            if synthetic_score > 50.0
+            else f"{real_score:.2f}% Human"
+        )
+    else:
+        signal_score = "Need clearer speech"
     semantic_intent = f"{semantic_label.upper()} ({semantic_score:.2f})"
     fusion_status, is_threat = build_fusion_status(
         identity_result=identity_result,
@@ -825,6 +849,8 @@ async def orchestrate_late_fusion(
             "semantic_score": round(semantic_score, 4),
             "semantic_label": semantic_label,
             "transcript_context": text_context,
+            "semantic_context_seconds": round(float(semantic_context_seconds), 2),
+            "signal_quality": signal_quality,
             "fusion_status": fusion_status,
             "identity_chunk_count": (
                 session["chunks_processed"] if session is not None else None
@@ -834,6 +860,30 @@ async def orchestrate_late_fusion(
             **identity_result.to_telemetry(),
         }
     )
+
+
+async def _immediate_float(value: float) -> float:
+    return value
+
+
+async def _immediate_dict(value: dict) -> dict:
+    return value
+
+
+def _semantic_context_ready(text_context: str, context_seconds: float) -> bool:
+    return (
+        context_seconds >= SEMANTIC_MIN_CONTEXT_SECONDS
+        and len(text_context.strip()) >= SEMANTIC_MIN_CHARS
+    )
+
+
+def _semantic_waiting_result(text_context: str, context_seconds: float) -> dict:
+    if not text_context.strip():
+        return {"semantic_score": 0.0, "label": "need_speech"}
+    return {
+        "semantic_score": 0.0,
+        "label": f"building_context_{context_seconds:.0f}s",
+    }
 
 
 async def broadcast_identity_telemetry(identity_result: IdentityResult, session_id: str) -> None:
@@ -910,7 +960,25 @@ async def process_identity_chunk(
                 candidate_count=candidate_count,
             )
         except ValueError as exc:
-            print(f"Skipped TOFU candidate chunk: {exc}")
+            reason = str(exc)
+            display_text = (
+                "Need More Speech" if reason == "insufficient_audio" else "Speech Too Quiet"
+            )
+            identity_result = IdentityResult(
+                caller_id=caller_id,
+                status="candidate_waiting_for_speech",
+                identity_score=0.0,
+                similarity=None,
+                match_confidence=None,
+                display_text=display_text,
+                reason=f"tofu_candidate_{reason}",
+                enrolled=False,
+                duration_seconds=identity_result.duration_seconds,
+                identification_mode="tofu_candidate",
+                identified_caller_id=None,
+                candidate_count=0,
+            )
+            print(f"Skipped TOFU candidate chunk: {reason}")
         except RuntimeError as exc:
             print(f"Unable to collect TOFU candidate chunk: {exc}")
 
@@ -945,10 +1013,50 @@ def sync_transcribe_wav_bytes(wav_bytes: bytes) -> str:
                 pass
 
 
+def measure_audio_quality(audio: np.ndarray) -> dict[str, float | bool | str]:
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        return {
+            "usable": False,
+            "reason": "empty_audio",
+            "rms": 0.0,
+            "peak": 0.0,
+            "active_ratio": 0.0,
+        }
+
+    if np.max(np.abs(samples)) > 1.5:
+        samples = samples / 32768.0
+
+    abs_samples = np.abs(samples)
+    rms = float(np.sqrt(np.mean(np.square(samples))))
+    peak = float(np.max(abs_samples))
+    active_ratio = float(np.mean(abs_samples >= SIGNAL_MIN_PEAK))
+    usable = (
+        rms >= SIGNAL_MIN_RMS
+        and peak >= SIGNAL_MIN_PEAK
+        and active_ratio >= SIGNAL_MIN_ACTIVE_RATIO
+    )
+    if usable:
+        reason = "usable_speech"
+    elif rms < SIGNAL_MIN_RMS:
+        reason = "low_rms"
+    elif peak < SIGNAL_MIN_PEAK:
+        reason = "low_peak"
+    else:
+        reason = "low_speech_activity"
+    return {
+        "usable": usable,
+        "reason": reason,
+        "rms": round(rms, 5),
+        "peak": round(peak, 5),
+        "active_ratio": round(active_ratio, 5),
+    }
+
+
 async def consume_audio_track(track, caller_id: str, session_id: str):
     print("Audio buffer engine started.")
     audio_buffer = []
-    context_memory = []
+    context_memory: deque[tuple[str, float]] = deque()
     sample_rate = 0
     target_seconds = 3.0
     overlap_ratio = 0.5
@@ -983,8 +1091,12 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
                 combined_audio = np.concatenate(audio_buffer, axis=1)
                 chunk_audio = combined_audio.T
                 max_volume = np.max(np.abs(chunk_audio))
+                signal_quality = measure_audio_quality(chunk_audio)
                 print(
-                    f"Dispatching full pipeline chunk {chunk_counter} | peak={float(max_volume):.2f}"
+                    "Dispatching full pipeline chunk "
+                    f"{chunk_counter} | peak={float(max_volume):.2f} "
+                    f"| rms={signal_quality['rms']} | active={signal_quality['active_ratio']} "
+                    f"| quality={signal_quality['reason']}"
                 )
 
                 wav_io = io.BytesIO()
@@ -992,12 +1104,17 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
                 wav_bytes = wav_io.getvalue()
                 base64_audio = base64.b64encode(wav_bytes).decode("utf-8")
 
-                transcription = await asyncio.to_thread(sync_transcribe_wav_bytes, wav_bytes)
-                if transcription:
-                    context_memory.append(transcription)
-                if len(context_memory) > 10:
-                    context_memory.pop(0)
-                recent_context = " ".join(context_memory[-7:])
+                if signal_quality["usable"]:
+                    transcription = await asyncio.to_thread(sync_transcribe_wav_bytes, wav_bytes)
+                    if transcription:
+                        context_memory.append((transcription, target_seconds))
+                else:
+                    transcription = ""
+                    print(f"Skipping RawNet/STT for weak audio: {signal_quality['reason']}")
+                while sum(duration for _, duration in context_memory) > SEMANTIC_MAX_CONTEXT_SECONDS:
+                    context_memory.popleft()
+                semantic_context_seconds = sum(duration for _, duration in context_memory)
+                recent_context = " ".join(text for text, _ in context_memory)
 
                 identity_result = await process_identity_chunk(
                     caller_id=caller_id,
@@ -1012,6 +1129,8 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
                         text_context=recent_context,
                         identity_result=identity_result,
                         session_id=session_id,
+                        signal_quality=signal_quality,
+                        semantic_context_seconds=semantic_context_seconds,
                     )
                 )
 
@@ -1047,7 +1166,8 @@ def _audio_frame_to_mono_int16(audio_array: np.ndarray, num_channels: int) -> np
 async def process_offer(params: Offer):
     print("Received WebRTC offer from Trust-Call.")
     offer = RTCSessionDescription(sdp=params.sdp, type=params.type)
-    pc = RTCPeerConnection()
+    ice_servers = [RTCIceServer(urls=WEBRTC_STUN_URL)] if WEBRTC_STUN_URL else []
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
     peer_connections.add(pc)
     live_session = live_identity_monitor.start_session(
         caller_id=params.caller_id,
