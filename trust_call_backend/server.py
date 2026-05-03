@@ -24,6 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 try:
+    from trust_call_backend.fusion import build_fusion_status
+except ModuleNotFoundError:
+    from fusion import build_fusion_status  # type: ignore
+
+try:
     from faster_whisper import WhisperModel
 except ModuleNotFoundError:  # pragma: no cover - optional runtime dependency
     WhisperModel = None  # type: ignore[assignment]
@@ -65,9 +70,17 @@ SEMANTIC_MIN_CHARS = int(os.getenv("TRUST_CALL_SEMANTIC_MIN_CHARS", "20"))
 
 app = FastAPI(title="Trust-Call WebRTC Gateway", version="1.0")
 
+
+def _parse_cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", "*")
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+CORS_ORIGINS = _parse_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -138,14 +151,14 @@ metrics = MetricsRegistry()
 
 
 class Offer(BaseModel):
-    sdp: str
-    type: str
-    caller_id: str = "unknown"
+    sdp: str = Field(..., min_length=1, max_length=200_000)
+    type: str = Field(..., min_length=1, max_length=32)
+    caller_id: str = Field(default="unknown", max_length=128)
 
 
 class IdentityEnrollmentPayload(BaseModel):
-    caller_id: str
-    base64_audio: str
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
     allow_update: bool = False
     ema_alpha: float | None = None
     safe_to_enroll: bool = False
@@ -155,20 +168,20 @@ class IdentityEnrollmentPayload(BaseModel):
 
 
 class IdentityVerificationPayload(BaseModel):
-    caller_id: str
-    base64_audio: str
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
 
 
 class IdentityIdentificationPayload(BaseModel):
-    base64_audio: str
-    claimed_caller_id: str = "unknown"
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+    claimed_caller_id: str = Field(default="unknown", max_length=128)
     top_k: int = Field(default=3, ge=1, le=10)
 
 
 class LiveIdentityValidationPayload(BaseModel):
-    caller_id: str
-    base64_audio: str
-    session_id: str | None = None
+    caller_id: str = Field(..., min_length=1, max_length=128)
+    base64_audio: str = Field(..., min_length=1, max_length=12_000_000)
+    session_id: str | None = Field(default=None, max_length=128)
     dispatch_signal_auditor: bool = False
     identify_if_unenrolled: bool = False
     top_k: int = Field(default=3, ge=1, le=10)
@@ -756,34 +769,6 @@ async def fetch_distilbert(text: str) -> dict:
     except Exception as exc:
         print(f"DistilBERT service unavailable: {exc}")
     return {"semantic_score": 0.0, "label": "semantic_unavailable"}
-
-
-def build_fusion_status(
-    identity_result: IdentityResult,
-    synthetic_score: float,
-    semantic_score: float,
-) -> tuple[str, bool]:
-    synthetic_threat = synthetic_score > 50.0
-    semantic_threat = semantic_score >= 0.6
-    identity_mismatch = identity_result.status in {"mismatch", "unknown_speaker"}
-    identity_review = identity_result.status in {
-        "review",
-        "identity_candidate",
-        "profile_incompatible",
-    }
-    identity_learning = identity_result.status == "candidate_collecting"
-
-    if (synthetic_threat or semantic_threat) and (identity_mismatch or identity_review):
-        return "THREAT DETECTED", True
-    if synthetic_threat or semantic_threat:
-        return "THREAT DETECTED", True
-    if identity_mismatch:
-        return "IDENTITY REVIEW", False
-    if identity_review:
-        return "IDENTITY CAUTION", False
-    if identity_learning:
-        return "LEARNING VOICE", False
-    return "SAFE", False
 
 
 async def orchestrate_late_fusion(
