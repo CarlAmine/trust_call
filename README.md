@@ -13,11 +13,11 @@ Current `dev` includes the full demo pipeline:
 
 Current public EEP deployment:
 
-- Cloud provider: GCP Cloud Run.
-- Public EEP URL: `https://trust-call-backend-uccxv72y5a-ew.a.run.app`
-- Deployed IEP1 URL: `https://rawnet-service-uccxv72y5a-ew.a.run.app`
-- Deployed IEP2 URL: `https://distilbert-service-uccxv72y5a-ew.a.run.app`
-- Mobile app default backend: the public GCP EEP URL above.
+- Cloud provider: GCP Compute Engine VM.
+- Public EEP URL: `http://35.189.221.158:8080`
+- Grafana URL: `http://35.189.221.158:3000`
+- Prometheus URL: `http://35.189.221.158:9090`
+- Mobile app default backend: the public VM EEP URL above.
 
 ## Architecture
 
@@ -123,20 +123,20 @@ The Android app currently supports:
 - Displaying live Signal, Semantic, Identity, confidence, candidate, chunk, frame, buffer, TOFU, reason, and fusion telemetry.
 - Saving or discarding TOFU voice profiles after a call.
 
-For a physical Android phone connected by USB, keep the backend host override as `127.0.0.1` and run:
+For the deployed VM demo, `TrustCallApp/src/config/backend.ts` sets `CLOUD_BACKEND_BASE_URL` to the public GCP VM EEP URL. With that value set, the app uses:
+
+- HTTP: `http://35.189.221.158:8080`
+- WebSocket: `ws://35.189.221.158:8080`
+
+To return to laptop-local testing, set `CLOUD_BACKEND_BASE_URL` to `null`.
+
+For a physical Android phone connected by USB against a laptop-local backend, keep the backend host override as `127.0.0.1` and run:
 
 ```powershell
 adb reverse tcp:8080 tcp:8080
 ```
 
 For a LAN/Wi-Fi phone test without `adb reverse`, update `TrustCallApp/src/config/backend.ts` so `MANUAL_BACKEND_HOST_OVERRIDE` points to the laptop IP address.
-
-For the cloud demo, `TrustCallApp/src/config/backend.ts` sets `CLOUD_BACKEND_BASE_URL` to the public GCP Cloud Run EEP URL. With that value set, the app uses:
-
-- HTTP: `https://trust-call-backend-uccxv72y5a-ew.a.run.app`
-- WebSocket: `wss://trust-call-backend-uccxv72y5a-ew.a.run.app`
-
-To return to local laptop testing, set `CLOUD_BACKEND_BASE_URL` to `null`.
 
 ## Monitoring
 
@@ -157,7 +157,7 @@ Grafana is provisioned automatically with:
 Start monitoring:
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call
+cd C:\Users\JL\Desktop\trust_call_full_pipeline
 docker compose up
 ```
 
@@ -168,35 +168,51 @@ Open:
 
 ## Cloud Deployment
 
-The live demo deployment uses GCP Cloud Run:
+The live demo deployment uses a GCP Compute Engine VM because the app streams live WebRTC audio to an `aiortc` backend. Cloud Run was suitable for HTTP APIs, but it did not reliably carry the WebRTC media path for this project.
 
-| Service | Cloud Run name | Ingress | Role |
+| Service | Deployment | Public Port | Role |
 | --- | --- | --- | --- |
-| EEP | `trust-call-backend` | Public | System boundary, WebRTC offer handling, Whisper, IEP3, EEP fusion |
-| IEP1 | `rawnet-service` | Service endpoint | RawNet signal/deepfake inference |
-| IEP2 | `distilbert-service` | Service endpoint | DistilBERT semantic scam/coercion inference |
+| EEP | `trust-call-backend` Docker Compose service with host networking | `8080` | Public system boundary, WebRTC offer handling, Whisper, IEP3, EEP fusion |
+| IEP1 | `rawnet-service` Docker Compose service | `8000` | RawNet signal/deepfake inference |
+| IEP2 | `distilbert-service` Docker Compose service | `8002` | DistilBERT semantic scam/coercion inference |
+| Prometheus | Docker Compose service | `9090` | Metrics scraping |
+| Grafana | Docker Compose service | `3000` | Dashboard |
 
-The backend is configured with:
+The VM backend is configured with:
 
 ```text
-RAWNET_URL=https://rawnet-service-uccxv72y5a-ew.a.run.app/predict
-DISTILBERT_URL=https://distilbert-service-uccxv72y5a-ew.a.run.app/predict
+RAWNET_URL=http://127.0.0.1:8000/predict
+DISTILBERT_URL=http://127.0.0.1:8002/predict
+TRUST_CALL_WEBRTC_STUN_URL=stun:stun.l.google.com:19302
 ```
 
-Kubernetes manifests are included under `deployment/kubernetes/` for portability and orchestration evidence. Cloud Run is the live demo target because it provides managed HTTPS ingress, autoscaling, and simple operation within the project deadline.
+The backend container uses host networking so `aiortc` can expose reachable WebRTC candidates from the VM. RawNet and DistilBERT still run as separate services and are reached through their published localhost ports.
 
-Deployment tradeoff: the public EEP is unauthenticated for the class demo, while model services are not intended as the public API. Production should add authentication, request limits, encrypted storage, secrets management, and hardened observability.
+Required VM firewall ports for the demo:
+
+```text
+TCP 8080    EEP/backend
+TCP 3000    Grafana
+TCP 9090    Prometheus
+TCP 8000    RawNet debug
+TCP 8002    DistilBERT debug
+UDP 1024-65535 WebRTC media
+```
+
+Kubernetes manifests are included under `deployment/kubernetes/` for portability and orchestration evidence. The working live demo target is the GCP VM because it supports the current WebRTC media path with fewer moving parts before the deadline.
+
+Deployment tradeoff: the public EEP is unauthenticated and the demo firewall is permissive for WebRTC. Production should add authentication, request limits, TURN, tighter firewall rules, encrypted profile storage, secret management, and hardened observability.
 
 Cloud smoke tests:
 
 ```powershell
-Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/docs
-Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/metrics
+Invoke-WebRequest http://35.189.221.158:8080/docs
+Invoke-WebRequest http://35.189.221.158:8080/metrics
 ```
 
 ## Friend Cloud Demo Quickstart
 
-Use this path when testing the deployed demo without local Python models.
+Use this path when testing the deployed VM demo without local Python models.
 
 What your tester needs:
 
@@ -214,30 +230,90 @@ What your tester does not need:
 - No local ECAPA/IEP3 model cache.
 - No `adb reverse tcp:8080 tcp:8080`.
 
-The mobile app already points to the deployed public EEP:
+The mobile app already points to the deployed public VM EEP:
 
 ```text
-https://trust-call-backend-uccxv72y5a-ew.a.run.app
+http://35.189.221.158:8080
 ```
 
-Run the app:
+### Path A: React Native Dev Run
+
+Use this when actively debugging the app from a laptop.
 
 ```powershell
 git checkout dev
 git pull origin dev
 cd TrustCallApp
 npm install
-npx react-native run-android
 ```
 
-If using a specific physical device:
+Terminal 1:
 
 ```powershell
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp
+
+$env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"
+$env:ANDROID_HOME="C:\Users\JL\AppData\Local\Android\Sdk"
+$env:Path="$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator;$env:Path"
+
 adb devices
-npx react-native run-android --device <device_id>
 ```
 
-Expected result:
+Terminal 2:
+
+```powershell
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp
+npm start -- --reset-cache
+```
+
+Terminal 3:
+
+```powershell
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp
+
+$env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"
+$env:ANDROID_HOME="C:\Users\JL\AppData\Local\Android\Sdk"
+$env:Path="$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator;$env:Path"
+
+npx react-native run-android --device <device_id> --port 8082
+```
+
+Do not run a local backend and do not run `adb reverse` for the VM demo.
+
+### Path B: Standalone APK
+
+Use this when the phone should run without staying plugged into the laptop.
+
+Build the APK:
+
+```powershell
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp
+
+$env:JAVA_HOME="C:\Program Files\Android\Android Studio\jbr"
+$env:ANDROID_HOME="C:\Users\JL\AppData\Local\Android\Sdk"
+$env:Path="$env:JAVA_HOME\bin;$env:ANDROID_HOME\platform-tools;$env:ANDROID_HOME\emulator;$env:Path"
+
+cd android
+.\gradlew.bat assembleRelease
+```
+
+Install while the phone is plugged in:
+
+```powershell
+adb install -r C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp\android\app\build\outputs\apk\release\app-release.apk
+```
+
+After installation, unplug the phone and open Trust-Call normally. The app still calls the deployed VM EEP over the internet.
+
+If release build fails, build/install debug instead:
+
+```powershell
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp\android
+.\gradlew.bat assembleDebug
+adb install -r C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp\android\app\build\outputs\apk\debug\app-debug.apk
+```
+
+### Expected Result
 
 1. The app opens on Android.
 2. Select or simulate a caller.
@@ -249,7 +325,14 @@ Expected result:
 If the app cannot connect, first verify the public backend opens:
 
 ```text
-https://trust-call-backend-uccxv72y5a-ew.a.run.app/docs
+http://35.189.221.158:8080/docs
+```
+
+If the app connects but telemetry stays at zero frames, check VM logs:
+
+```bash
+cd ~/trust_call
+docker compose logs -f trust-call-backend
 ```
 
 Demo limitation: in this deployed demo, IEP3 runs in the hosted backend so testers do not need the ECAPA model locally. The intended production privacy direction is to move IEP3 embeddings/model execution to secure on-device storage.
@@ -261,35 +344,35 @@ Use separate terminals.
 ### Terminal 1: RawNet
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call\rawnet-service
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\rawnet-service
 python -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 ### Terminal 2: DistilBERT
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call\distilbert-service
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\distilbert-service
 python -m uvicorn main:app --host 0.0.0.0 --port 8002
 ```
 
 ### Terminal 3: Backend Gateway
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call
+cd C:\Users\JL\Desktop\trust_call_full_pipeline
 python -m uvicorn trust_call_backend.server:app --host 0.0.0.0 --port 8080
 ```
 
 ### Terminal 4: Monitoring
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call
+cd C:\Users\JL\Desktop\trust_call_full_pipeline
 docker compose up
 ```
 
 ### Terminal 5: Android App
 
 ```powershell
-cd C:\Users\JL\Desktop\trust_call\TrustCallApp
+cd C:\Users\JL\Desktop\trust_call_full_pipeline\TrustCallApp
 npx react-native run-android
 ```
 
