@@ -17,3 +17,4 @@ def test_metrics_registry_labels_rendered():
     m.inc('requests', status='ok')
     rendered = m.render()
     assert 'requests{status="ok"} 1.0' in rendered
+"""
