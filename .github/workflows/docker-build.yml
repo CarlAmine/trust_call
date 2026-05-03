@@ -8,35 +8,27 @@ on:
 
 jobs:
   build-rawnet-service:
-    name: Build RawNet Service Image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build RawNet Docker image (no push)
-        run: |
-          docker build ./rawnet-service -t trust-call-rawnet:ci-test
+      - name: Build RawNet Docker image
+        run: docker build -t trust-call-rawnet:ci-test ./rawnet-service
 
   build-distilbert-service:
-    name: Build DistilBERT Service Image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Build DistilBERT Docker image (no push)
-        run: |
-          docker build ./distilbert-service -t trust-call-distilbert:ci-test
+      - name: Build DistilBERT Docker image
+        run: docker build -t trust-call-distilbert:ci-test ./distilbert-service
 
   build-backend:
-    name: Build Backend Gateway Image
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check Dockerfile exists
+      - name: Build backend Docker image if Dockerfile exists
         run: |
-          [ -f trust_call_backend/Dockerfile ] && echo "Dockerfile found" || echo "No Dockerfile"
-
-      - name: Build backend Docker image (no push)
-        run: |
-          docker build -f trust_call_backend/Dockerfile . -t trust-call-backend:ci-test
+          if [ -f trust_call_backend/Dockerfile ]; then
+            docker build -f trust_call_backend/Dockerfile -t trust-call-backend:ci-test .
+          else
+            echo "No backend Dockerfile found; skipping backend image build."
+          fi
