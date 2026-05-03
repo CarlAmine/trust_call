@@ -36,9 +36,9 @@ This document describes Trust-Call's current production-oriented features, known
 - **Status:** Demo-only. See P0 plan below.
 
 ### CORS Policy
-- **Current:** `allow_origins=["*"]` – any origin can call the backend.
+- **Current:** CORS is configurable through `CORS_ORIGINS`. Demo defaults may still use `*`.
 - **Risk:** A malicious web page could invoke the API from a user's browser.
-- **Mitigation path:** Restrict to the known mobile app bundle ID / trusted web origin.
+- **Production requirement:** Set `CORS_ORIGINS` to trusted origins only.
 
 ### Rate Limiting
 - **Current:** No rate limiting on any endpoint.
@@ -46,8 +46,8 @@ This document describes Trust-Call's current production-oriented features, known
 - **Mitigation path:** Add `slowapi` middleware or a cloud load-balancer rate limit rule.
 
 ### Request Size Limits
-- **Current:** No explicit `max_content_length` is set. Large audio payloads could exhaust server memory.
-- **Mitigation path:** Add `app.add_middleware(ContentSizeLimitMiddleware, max_content_size=...)` or nginx proxy limit.
+- **Current:** Pydantic field-level request limits exist for SDP, caller IDs, session IDs, and base64 audio.
+- **Remaining gap:** Add a full reverse-proxy body-size limit in production (nginx/ingress).
 
 ### Secret Management
 - **Current:** Secrets are plain environment variables. No secret manager.
