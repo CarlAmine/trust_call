@@ -87,10 +87,10 @@ This document describes Trust-Call's current production-oriented features, known
 
 ### P0 – Before final presentation
 
-1. **Demo-mode API key check** – Set `ENABLE_DEMO_MODE=true` in `.env` to bypass auth; `false` requires `X-API-Key` header matching `API_KEY` env var.
+1. **Demo-mode API key check** – Planned but not implemented: API-key middleware. `ENABLE_DEMO_MODE`/`API_KEY` are documented env values, but middleware wiring is pending.
 2. **`.env.example`** – Committed. All real secrets go in `.env` (git-ignored).
 3. **Request size limit** – Add 10 MB body size cap to backend and services.
-4. **Stricter CORS** – Set `CORS_ALLOW_ORIGINS` env var; restrict from `*` to app origin.
+4. **Stricter CORS** – Set `CORS_ORIGINS` env var; restrict from `*` to app origin.
 5. **Health/metrics checks** – Verify `/metrics` endpoints respond before demo.
 6. **Demo evidence collection** – Run `scripts/collect_demo_evidence.py` and capture screenshots per `docs/demo_evidence/README.md`.
 
@@ -119,3 +119,9 @@ X-API-Key: <value matching API_KEY env var>
 Requests without a valid key return `401 Unauthorized`.
 
 This behavior is not yet implemented; it is documented as a P0 item. Do not set `ENABLE_DEMO_MODE=false` in production until the middleware is wired up.
+
+
+### RawNet Weights Handling (CI-safe)
+- RawNet Docker image builds without bundled model weights.
+- Real inference requires providing `RAWNET_MODEL_PATH` at runtime.
+- If weights are absent, `/health` reports `model_ready=false` and `/predict` returns `503` (no fake inference).

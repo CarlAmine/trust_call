@@ -3,10 +3,9 @@ import base64
 import io
 import os
 import tempfile
-from collections import defaultdict, deque
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
 from uuid import uuid4
 
 # Keep model downloads inside the project instead of the Windows user cache,
@@ -15,13 +14,28 @@ PROJECT_STATE_ROOT = Path(__file__).resolve().parent / "state"
 os.environ.setdefault("HF_HOME", str(PROJECT_STATE_ROOT / "huggingface"))
 os.environ.setdefault("HF_HUB_CACHE", str(PROJECT_STATE_ROOT / "huggingface" / "hub"))
 
-import httpx
 import numpy as np
 import soundfile as sf
 from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
 from fastapi import FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
+try:
+    from trust_call_backend.fusion import build_fusion_status
+except ModuleNotFoundError:
+    from fusion import build_fusion_status  # type: ignore
+
+from trust_call_backend.metrics_registry import MetricsRegistry, _escape_metric_label
+from trust_call_backend.schemas import (
+    IdentityEnrollmentPayload,
+    IdentityIdentificationPayload,
+    IdentityVerificationPayload,
+    LiveIdentityValidationPayload,
+    LiveSessionEnrollmentPayload,
+    Offer,
+)
+from trust_call_backend.service_clients import fetch_distilbert_prediction, fetch_rawnet_prediction
 
 try:
     from trust_call_backend.fusion import build_fusion_status
@@ -85,66 +99,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-class MetricsRegistry:
-    def __init__(self):
-        self._counters: dict[tuple[str, tuple[tuple[str, str], ...]], float] = defaultdict(float)
-        self._lock = Lock()
-
-    def inc(self, name: str, amount: float = 1.0, **labels: str) -> None:
-        label_key = tuple(sorted((key, str(label_value)) for key, label_value in labels.items()))
-        with self._lock:
-            self._counters[(name, label_key)] += amount
-
-    def render(self, gauges: dict[str, float] | None = None) -> str:
-        lines = [
-            "# HELP trust_call_gateway_sessions_started_total Live call sessions started by source.",
-            "# TYPE trust_call_gateway_sessions_started_total counter",
-            "# HELP trust_call_gateway_audio_frames_total Audio frames received by the gateway.",
-            "# TYPE trust_call_gateway_audio_frames_total counter",
-            "# HELP trust_call_gateway_audio_chunks_total Audio chunks processed by the gateway.",
-            "# TYPE trust_call_gateway_audio_chunks_total counter",
-            "# HELP trust_call_iep3_identity_results_total IEP3 identity decisions by status.",
-            "# TYPE trust_call_iep3_identity_results_total counter",
-            "# HELP trust_call_iep3_candidate_embeddings_total TOFU candidate embeddings collected.",
-            "# TYPE trust_call_iep3_candidate_embeddings_total counter",
-            "# HELP trust_call_iep3_candidate_enrollments_total TOFU candidate enrollment outcomes.",
-            "# TYPE trust_call_iep3_candidate_enrollments_total counter",
-            "# HELP trust_call_gateway_fusion_results_total EEP fusion outcomes.",
-            "# TYPE trust_call_gateway_fusion_results_total counter",
-            "# HELP trust_call_gateway_errors_total Gateway errors recorded by source.",
-            "# TYPE trust_call_gateway_errors_total counter",
-        ]
-        with self._lock:
-            counters = list(self._counters.items())
-
-        for (name, labels), value in sorted(counters):
-            label_text = ""
-            if labels:
-                label_text = "{" + ",".join(
-                    f'{key}="{_escape_metric_label(label_value)}"'
-                    for key, label_value in labels
-                ) + "}"
-            lines.append(f"{name}{label_text} {value}")
-
-        if gauges:
-            lines.extend(
-                [
-                    "# HELP trust_call_gateway_active_sessions Active live sessions retained in memory.",
-                    "# TYPE trust_call_gateway_active_sessions gauge",
-                    "# HELP trust_call_iep3_enrolled_profiles Stored local IEP3 speaker profiles.",
-                    "# TYPE trust_call_iep3_enrolled_profiles gauge",
-                ]
-            )
-            for name, value in sorted(gauges.items()):
-                lines.append(f"{name} {value}")
-
-        return "\n".join(lines) + "\n"
-
-
-def _escape_metric_label(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
 metrics = MetricsRegistry()
@@ -781,12 +735,12 @@ async def orchestrate_late_fusion(
 ) -> None:
     signal_quality = signal_quality or {"usable": True, "reason": "not_measured"}
     rawnet_task = (
-        fetch_rawnet(base64_audio)
+        fetch_rawnet_prediction(base64_audio, RAWNET_URL)
         if signal_quality.get("usable", True)
         else _immediate_float(0.0)
     )
     distilbert_task = (
-        fetch_distilbert(text_context)
+        fetch_distilbert_prediction(text_context, DISTILBERT_URL)
         if _semantic_context_ready(text_context, semantic_context_seconds)
         else _immediate_dict(_semantic_waiting_result(text_context, semantic_context_seconds))
     )
