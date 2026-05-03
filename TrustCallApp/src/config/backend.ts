@@ -4,7 +4,7 @@ const BACKEND_PORT = 8080;
 const ANDROID_EMULATOR_HOST = '10.0.2.2';
 const IOS_SIMULATOR_HOST = '127.0.0.1';
 const CLOUD_BACKEND_BASE_URL: string | null =
-  'https://trust-call-backend-uccxv72y5a-ew.a.run.app';
+  'http://35.189.221.158:8080';
 
 // Set this to a LAN IP like "192.168.1.10" when you want to force a physical-device target.
 const MANUAL_BACKEND_HOST_OVERRIDE: string | null = '127.0.0.1';
