@@ -1,4 +1,8 @@
-from trust_call_backend.metrics_registry import MetricsRegistry
+import pytest
+pytestmark = pytest.mark.requires_models
+
+"""
+tests/test_identity_flow.py
 
 
 def test_metrics_registry_increment_counter():
