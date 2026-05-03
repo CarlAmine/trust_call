@@ -19,4 +19,4 @@ scrape_configs:
   - job_name: 'iep3_identity_gateway'
     metrics_path: '/metrics'
     static_configs:
-      - targets: ['trust-call-backend:8080']
+      - targets: ['host.docker.internal:8080']

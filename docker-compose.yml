@@ -31,11 +31,10 @@ services:
       context: .
       dockerfile: trust_call_backend/Dockerfile
     container_name: trust_call_backend
-    ports:
-      - "8080:8080"
+    network_mode: host
     environment:
-      RAWNET_URL: http://rawnet-service:8000/predict
-      DISTILBERT_URL: http://distilbert-service:8002/predict
+      RAWNET_URL: http://127.0.0.1:8000/predict
+      DISTILBERT_URL: http://127.0.0.1:8002/predict
       TRUST_CALL_SIGNAL_MIN_RMS: "0.0025"
       TRUST_CALL_SIGNAL_MIN_PEAK: "0.02"
       TRUST_CALL_SIGNAL_MIN_ACTIVE_RATIO: "0.015"
@@ -50,6 +49,8 @@ services:
     container_name: trust_call_prometheus
     ports:
       - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
