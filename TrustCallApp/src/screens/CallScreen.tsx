@@ -14,6 +14,11 @@ const CallScreen = ({ navigation, route }: any) => {
   const [peerConnection, setPeerConnection] = useState<any>(null);
   const [sdpOffer, setSdpOffer] = useState<string>('');
 
+
+  const [semanticColor, setSemanticColor] = useState<string>('#4CAF50');
+
+
+
   // Phase 3: Telemetry State Variables
   const [signalScore, setSignalScore] = useState<string>('Analyzing...');
   const [semanticStatus, setSemanticStatus] = useState<string>('Pending...');
@@ -224,6 +229,7 @@ const CallScreen = ({ navigation, route }: any) => {
             setSignalColor(data.is_threat ? '#FF3B30' : '#4CAF50'); 
 
             setSemanticStatus(data.semantic_intent);
+            setSemanticColor(data.semantic_label === 'suspicious' ? '#FF3B30' : '#4CAF50');
             applyIdentityTelemetry(data, data.identity_chunk_count);
             setFusionStatus(data.fusion_status);
           } catch (error) {
@@ -412,7 +418,7 @@ const handleAcceptCall = () => {
         
         <View style={styles.metricRow}>
           <Text style={styles.metricLabel}>Semantic</Text>
-          <Text style={styles.metricValueSafe}>{semanticStatus}</Text>
+          <Text style={[styles.metricValueSafe, { color: semanticColor }]}>{semanticStatus}</Text> 
         </View>
 
         <View style={styles.metricRow}>

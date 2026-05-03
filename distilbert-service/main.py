@@ -25,8 +25,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 # --- NEW CODE (Fine-Tuned Neural Network) ---
 DEFAULT_MODEL_NAME = os.getenv("DISTILBERT_MODEL_NAME", "./custom_scam_model")
-USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "true").lower() in {"1", "true", "yes"}
-
+#USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "true").lower() in {"1", "true", "yes"}
+USE_CLASSIFIER = os.getenv("DISTILBERT_USE_CLASSIFIER", "false").lower() in {"1", "true", "yes"}
 
 USE_EMBEDDINGS = os.getenv("DISTILBERT_USE_EMBEDDINGS", "true").lower() in {"1", "true", "yes"}
 USE_CUDA = os.getenv("DISTILBERT_USE_CUDA", "false").lower() in {"1", "true", "yes"}

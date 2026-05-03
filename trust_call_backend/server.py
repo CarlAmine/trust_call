@@ -1106,6 +1106,7 @@ async def consume_audio_track(track, caller_id: str, session_id: str):
 
                 if signal_quality["usable"]:
                     transcription = await asyncio.to_thread(sync_transcribe_wav_bytes, wav_bytes)
+                    print(f"🔥 WHISPER HEARD: '{transcription}'")
                     if transcription:
                         context_memory.append((transcription, target_seconds))
                 else:
