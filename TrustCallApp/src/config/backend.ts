@@ -3,6 +3,8 @@ import { NativeModules, Platform } from 'react-native';
 const BACKEND_PORT = 8080;
 const ANDROID_EMULATOR_HOST = '10.0.2.2';
 const IOS_SIMULATOR_HOST = '127.0.0.1';
+const CLOUD_BACKEND_BASE_URL: string | null =
+  'https://trust-call-backend-uccxv72y5a-ew.a.run.app';
 
 // Set this to a LAN IP like "192.168.1.10" when you want to force a physical-device target.
 const MANUAL_BACKEND_HOST_OVERRIDE: string | null = '127.0.0.1';
@@ -48,10 +50,18 @@ function resolveBackendHost(): string {
 }
 
 export function getResolvedBackendBaseUrl(): string {
+  if (CLOUD_BACKEND_BASE_URL) {
+    return CLOUD_BACKEND_BASE_URL.replace(/\/+$/, '');
+  }
+
   return `http://${resolveBackendHost()}:${BACKEND_PORT}`;
 }
 
 export function getResolvedBackendWsBaseUrl(): string {
+  if (CLOUD_BACKEND_BASE_URL) {
+    return CLOUD_BACKEND_BASE_URL.replace(/^http/i, 'ws').replace(/\/+$/, '');
+  }
+
   return `ws://${resolveBackendHost()}:${BACKEND_PORT}`;
 }
 

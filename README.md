@@ -11,16 +11,24 @@ Current `dev` includes the full demo pipeline:
 - React Native Android app: simulated call flow, contact resolution, live telemetry display, and IEP3 voice-profile save/discard flow.
 - Monitoring: Prometheus and Grafana for RawNet, DistilBERT, and the IEP3/backend gateway.
 
+Current public EEP deployment:
+
+- Cloud provider: GCP Cloud Run.
+- Public EEP URL: `https://trust-call-backend-uccxv72y5a-ew.a.run.app`
+- Deployed IEP1 URL: `https://rawnet-service-uccxv72y5a-ew.a.run.app`
+- Deployed IEP2 URL: `https://distilbert-service-uccxv72y5a-ew.a.run.app`
+- Mobile app default backend: the public GCP EEP URL above.
+
 ## Architecture
 
 ```text
 React Native app
-  -> WebRTC audio offer to backend /offer
+  -> WebRTC audio offer to public EEP /offer
   -> backend receives live microphone audio
   -> 3-second overlapping audio chunks
-  -> IEP1 RawNet service on :8000
+  -> IEP1 RawNet service
   -> Whisper STT inside backend
-  -> IEP2 DistilBERT service on :8002
+  -> IEP2 DistilBERT service
   -> IEP3 ECAPA identity auditor inside backend
   -> EEP late fusion
   -> WebSocket + polling telemetry back to mobile
@@ -123,15 +131,22 @@ adb reverse tcp:8080 tcp:8080
 
 For a LAN/Wi-Fi phone test without `adb reverse`, update `TrustCallApp/src/config/backend.ts` so `MANUAL_BACKEND_HOST_OVERRIDE` points to the laptop IP address.
 
+For the cloud demo, `TrustCallApp/src/config/backend.ts` sets `CLOUD_BACKEND_BASE_URL` to the public GCP Cloud Run EEP URL. With that value set, the app uses:
+
+- HTTP: `https://trust-call-backend-uccxv72y5a-ew.a.run.app`
+- WebSocket: `wss://trust-call-backend-uccxv72y5a-ew.a.run.app`
+
+To return to local laptop testing, set `CLOUD_BACKEND_BASE_URL` to `null`.
+
 ## Monitoring
 
 Prometheus and Grafana are configured through Docker Compose.
 
 Prometheus scrapes:
 
-- `rawnet_audio_ai` at `host.docker.internal:8000/metrics`
-- `distilbert_semantic_ai` at `host.docker.internal:8002/metrics`
-- `iep3_identity_gateway` at `host.docker.internal:8080/metrics`
+- `rawnet_audio_ai` at `rawnet-service:8000/metrics`
+- `distilbert_semantic_ai` at `distilbert-service:8002/metrics`
+- `iep3_identity_gateway` at `trust-call-backend:8080/metrics`
 
 Grafana is provisioned automatically with:
 
@@ -150,6 +165,34 @@ Open:
 
 - Prometheus: `http://localhost:9090`
 - Grafana: `http://localhost:3000`
+
+## Cloud Deployment
+
+The live demo deployment uses GCP Cloud Run:
+
+| Service | Cloud Run name | Ingress | Role |
+| --- | --- | --- | --- |
+| EEP | `trust-call-backend` | Public | System boundary, WebRTC offer handling, Whisper, IEP3, EEP fusion |
+| IEP1 | `rawnet-service` | Service endpoint | RawNet signal/deepfake inference |
+| IEP2 | `distilbert-service` | Service endpoint | DistilBERT semantic scam/coercion inference |
+
+The backend is configured with:
+
+```text
+RAWNET_URL=https://rawnet-service-uccxv72y5a-ew.a.run.app/predict
+DISTILBERT_URL=https://distilbert-service-uccxv72y5a-ew.a.run.app/predict
+```
+
+Kubernetes manifests are included under `deployment/kubernetes/` for portability and orchestration evidence. Cloud Run is the live demo target because it provides managed HTTPS ingress, autoscaling, and simple operation within the project deadline.
+
+Deployment tradeoff: the public EEP is unauthenticated for the class demo, while model services are not intended as the public API. Production should add authentication, request limits, encrypted storage, secrets management, and hardened observability.
+
+Cloud smoke tests:
+
+```powershell
+Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/docs
+Invoke-WebRequest https://trust-call-backend-uccxv72y5a-ew.a.run.app/metrics
+```
 
 ## Running The Local Demo
 
@@ -187,9 +230,10 @@ docker compose up
 
 ```powershell
 cd C:\Users\JL\Desktop\trust_call\TrustCallApp
-adb reverse tcp:8080 tcp:8080
 npx react-native run-android
 ```
+
+`adb reverse tcp:8080 tcp:8080` is only required when `CLOUD_BACKEND_BASE_URL` is `null` and the app is targeting a laptop-local backend.
 
 If multiple Android devices are connected:
 
